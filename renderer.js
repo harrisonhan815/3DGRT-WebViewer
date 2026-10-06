@@ -78,7 +78,7 @@ export class WebGpuRayRenderer {
         this.context = canvas.getContext("webgpu");
         this.format = navigator.gpu.getPreferredCanvasFormat();
         this.modelBuffers = [];
-        this.uniformData = new ArrayBuffer(112);
+        this.uniformData = new ArrayBuffer(128);
         this.uniformFloats = new Float32Array(this.uniformData);
         this.uniformUints = new Uint32Array(this.uniformData);
         this.width = 0;
@@ -90,6 +90,8 @@ export class WebGpuRayRenderer {
         this.lostReason = null;
         this.frameCount = 0;
         this.lastGpuMs = null;
+        this.lastTileStats = null;
+        this.lastMode = null;
         device.lost.then(info => { this.lostReason = info.message || "The graphics device was lost."; });
     }
 
@@ -98,11 +100,23 @@ export class WebGpuRayRenderer {
         const response = await fetch(new URL("./trace.wgsl", import.meta.url));
         if (!response.ok) throw new Error(`Cannot load trace.wgsl: HTTP ${response.status}.`);
         const traceSource = await response.text();
+        const tiledResponse = await fetch(new URL("./tiled.wgsl", import.meta.url));
+        if (!tiledResponse.ok) throw new Error(`Cannot load tiled.wgsl: HTTP ${tiledResponse.status}.`);
+        const tiledSource = traceSource.slice(0, traceSource.indexOf("@compute @workgroup_size")) + await tiledResponse.text();
         const traceModule = await checkedShader(this.device, traceSource, "3DGRT trace.wgsl");
+        const tiledModule = await checkedShader(this.device, tiledSource, "3DGRT tiled.wgsl");
         const presentModule = await checkedShader(this.device, PRESENT_SHADER, "3DGRT present");
         this.computePipeline = await this.device.createComputePipelineAsync({
             label: "3DGRT quartic reference tracing", layout: "auto",
             compute: {module: traceModule, entryPoint: "trace"},
+        });
+        this.tiledPipeline = await this.device.createComputePipelineAsync({
+            label: "3DGRT tiled reference tracing", layout: "auto",
+            compute: {module: tiledModule, entryPoint: "traceTiled"},
+        });
+        this.projectPipeline = await this.device.createComputePipelineAsync({
+            label: "3DGRT conservative support projection", layout: "auto",
+            compute: {module: tiledModule, entryPoint: "project"},
         });
         this.presentPipeline = await this.device.createRenderPipelineAsync({
             label: "3DGRT present without additional gamma", layout: "auto",
@@ -114,6 +128,8 @@ export class WebGpuRayRenderer {
             label: "3DGRT camera", size: this.uniformData.byteLength,
             usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST,
         });
+        this.tileStatsBuffer = this.device.createBuffer({size: 32, usage: GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_SRC | GPUBufferUsage.COPY_DST});
+        this.tileStatsReadback = this.device.createBuffer({size: 32, usage: GPUBufferUsage.COPY_DST | GPUBufferUsage.MAP_READ});
         if (this.device.features.has("timestamp-query")) {
             this.timestampQuery = this.device.createQuerySet({label: "3DGRT compute timing", type: "timestamp", count: 2});
             this.timestampResolve = this.device.createBuffer({size: 16, usage: GPUBufferUsage.QUERY_RESOLVE | GPUBufferUsage.COPY_SRC});
@@ -158,6 +174,7 @@ export class WebGpuRayRenderer {
             }
         }
         const nextBuffers = [];
+        let nextProjected;
         this.device.pushErrorScope("out-of-memory");
         this.device.pushErrorScope("validation");
         let uploadError;
@@ -168,20 +185,33 @@ export class WebGpuRayRenderer {
                 new Uint8Array(buffer.getMappedRange()).set(arrays[i]);
                 buffer.unmap();
             }
+            nextProjected = this.device.createBuffer({label: "Conservative projected support", size: count * 16, usage: GPUBufferUsage.STORAGE});
         } catch (error) {
             uploadError = error;
         }
         const validationError = await this.device.popErrorScope();
         const memoryError = await this.device.popErrorScope();
-        if (uploadError || validationError || memoryError) {
+        if (uploadError || validationError || memoryError || this.disposed || this.lostReason) {
             nextBuffers.forEach(buffer => buffer.destroy());
+            nextProjected?.destroy();
+            this.assertAvailable();
             throw new Error(`Model GPU upload failed: ${(uploadError || validationError || memoryError).message}`);
         }
-        await this.device.queue.onSubmittedWorkDone();
+        try {
+            await this.device.queue.onSubmittedWorkDone();
+            this.assertAvailable();
+        } catch (error) {
+            nextBuffers.forEach(buffer => buffer.destroy());
+            nextProjected?.destroy();
+            throw error;
+        }
         this.modelBuffers.forEach(buffer => buffer.destroy());
+        this.projectedBuffer?.destroy();
         this.modelBuffers = nextBuffers;
+        this.projectedBuffer = nextProjected;
         this.model = {...metadata, render: {...render, background}};
         this.lastGpuMs = null;
+        this.lastTileStats = null;
         this.frameCount = 0;
         this.updateBindGroups();
     }
@@ -208,6 +238,24 @@ export class WebGpuRayRenderer {
                 {binding: 4, resource: this.outputTexture.createView()},
             ],
         });
+        this.tiledBindGroup = this.device.createBindGroup({
+            layout: this.tiledPipeline.getBindGroupLayout(0),
+            entries: [
+                {binding: 0, resource: {buffer: this.uniformBuffer}},
+                ...this.modelBuffers.map((buffer, i) => ({binding: i + 1, resource: {buffer}})),
+                {binding: 4, resource: this.outputTexture.createView()},
+                {binding: 5, resource: {buffer: this.tileStatsBuffer}},
+                {binding: 6, resource: {buffer: this.projectedBuffer}},
+            ],
+        });
+        this.projectBindGroup = this.device.createBindGroup({
+            layout: this.projectPipeline.getBindGroupLayout(0),
+            entries: [
+                {binding: 0, resource: {buffer: this.uniformBuffer}},
+                {binding: 1, resource: {buffer: this.modelBuffers[0]}},
+                {binding: 6, resource: {buffer: this.projectedBuffer}},
+            ],
+        });
         this.presentBindGroup = this.device.createBindGroup({
             layout: this.presentPipeline.getBindGroupLayout(0),
             entries: [{binding: 0, resource: this.outputTexture.createView()}],
@@ -224,6 +272,7 @@ export class WebGpuRayRenderer {
         this.width = width;
         this.height = height;
         this.lastGpuMs = null;
+        this.lastTileStats = null;
         this.frameCount = 0;
         this.canvas.width = width;
         this.canvas.height = height;
@@ -234,20 +283,33 @@ export class WebGpuRayRenderer {
         this.updateBindGroups();
     }
 
-    async render({width, height, measureGpu}) {
+    async render({width, height, measureGpu, mode = "tiled", tileCapacity = 2048}) {
         this.assertAvailable();
         if (!this.model || !this.camera) throw new Error("Load a model and set a camera before rendering.");
         if (this.rendering) throw new Error("A frame is already rendering. Await render() before scheduling another.");
+        if (mode !== "tiled" && mode !== "bvh") throw new Error("Rendering mode must be tiled or bvh.");
+        exactInteger(tileCapacity, "tileCapacity");
+        if (tileCapacity > 2048) throw new Error("tileCapacity must not exceed 2048.");
         this.rendering = true;
         const start = performance.now();
         // Sample GPU time once per 30 completed frames by default. Reading a
         // query requires a small extra map; it is included in renderMs, and
         // callers doing benchmarks may explicitly request every frame.
         let queryGpu = false;
+        let sampleStats = false;
+        let stripCount = 0;
+        let gpuMilliseconds = 0;
         this.device.pushErrorScope("validation");
         try {
             this.resize(width, height);
-            queryGpu = Boolean(this.timestampQuery && (measureGpu ?? (this.frameCount % 30 === 0)));
+            if (mode !== this.lastMode) {
+                this.lastGpuMs = null;
+                this.lastTileStats = null;
+                this.frameCount = 0;
+                this.lastMode = mode;
+            }
+            sampleStats = measureGpu ?? (this.frameCount % 30 === 0);
+            queryGpu = Boolean(this.timestampQuery && sampleStats);
             const camera = this.camera;
             const render = this.model.render;
             this.uniformFloats.fill(0);
@@ -258,38 +320,70 @@ export class WebGpuRayRenderer {
             this.uniformUints.set([width, height, render.sh_degree, this.model.bvh_node_count], 16);
             this.uniformFloats.set([render.min_response, render.min_alpha, render.min_transmittance, 0], 20);
             this.uniformFloats.set(render.background, 24);
-            this.device.queue.writeBuffer(this.uniformBuffer, 0, this.uniformData);
-            const encoder = this.device.createCommandEncoder({label: "3DGRT frame"});
-            const computeDescriptor = {label: "BVH ray tracing"};
-            if (queryGpu) computeDescriptor.timestampWrites = {
-                querySet: this.timestampQuery, beginningOfPassWriteIndex: 0, endOfPassWriteIndex: 1,
-            };
-            const compute = encoder.beginComputePass(computeDescriptor);
-            compute.setPipeline(this.computePipeline);
-            compute.setBindGroup(0, this.computeBindGroup);
-            compute.dispatchWorkgroups(Math.ceil(width / 8), Math.ceil(height / 8));
-            compute.end();
-            if (queryGpu) {
-                encoder.resolveQuerySet(this.timestampQuery, 0, 2, this.timestampResolve, 0);
-                encoder.copyBufferToBuffer(this.timestampResolve, 0, this.timestampReadback, 0, 16);
+            // Each submission covers at most about 128K pixels. Submit/await
+            // strips sequentially so navigation/disposal can stop between
+            // them. This bounds queued work, not worst-case ray complexity.
+            const stripRows = Math.max(8, Math.floor(Math.min(height, 131072 / width) / 8) * 8);
+            for (let row = 0; row < height; row += stripRows) {
+                this.assertAvailable();
+                const rows = Math.min(stripRows, height - row);
+                const last = row + rows === height;
+                this.uniformUints.set([row, this.model.gaussian_count, tileCapacity, 0], 28);
+                this.device.queue.writeBuffer(this.uniformBuffer, 0, this.uniformData);
+                const encoder = this.device.createCommandEncoder({label: `3DGRT ${mode} strip ${stripCount}`});
+                if (row === 0 && mode === "tiled") encoder.clearBuffer(this.tileStatsBuffer);
+                const computeDescriptor = {label: `${mode} projection and ray tracing`};
+                if (queryGpu) computeDescriptor.timestampWrites = {
+                    querySet: this.timestampQuery, beginningOfPassWriteIndex: 0, endOfPassWriteIndex: 1,
+                };
+                const compute = encoder.beginComputePass(computeDescriptor);
+                if (row === 0 && mode === "tiled") {
+                    compute.setPipeline(this.projectPipeline);
+                    compute.setBindGroup(0, this.projectBindGroup);
+                    compute.dispatchWorkgroups(Math.ceil(this.model.gaussian_count / 64));
+                }
+                compute.setPipeline(mode === "tiled" ? this.tiledPipeline : this.computePipeline);
+                compute.setBindGroup(0, mode === "tiled" ? this.tiledBindGroup : this.computeBindGroup);
+                compute.dispatchWorkgroups(Math.ceil(width / 8), Math.ceil(rows / 8));
+                compute.end();
+                if (queryGpu) {
+                    encoder.resolveQuerySet(this.timestampQuery, 0, 2, this.timestampResolve, 0);
+                    encoder.copyBufferToBuffer(this.timestampResolve, 0, this.timestampReadback, 0, 16);
+                }
+                if (last && sampleStats && mode === "tiled") encoder.copyBufferToBuffer(this.tileStatsBuffer, 0, this.tileStatsReadback, 0, 32);
+                if (last) {
+                    const present = encoder.beginRenderPass({
+                        label: "Present completed frame",
+                        colorAttachments: [{view: this.context.getCurrentTexture().createView(), loadOp: "clear", storeOp: "store", clearValue: [0, 0, 0, 1]}],
+                    });
+                    present.setPipeline(this.presentPipeline);
+                    present.setBindGroup(0, this.presentBindGroup);
+                    present.draw(3);
+                    present.end();
+                }
+                this.device.queue.submit([encoder.finish()]);
+                await this.device.queue.onSubmittedWorkDone();
+                this.assertAvailable();
+                if (queryGpu) {
+                    await this.timestampReadback.mapAsync(GPUMapMode.READ);
+                    try {
+                        const stamps = new BigUint64Array(this.timestampReadback.getMappedRange());
+                        gpuMilliseconds += Number(stamps[1] - stamps[0]) / 1e6;
+                    } finally {
+                        this.timestampReadback.unmap();
+                    }
+                }
+                stripCount++;
             }
-            const present = encoder.beginRenderPass({
-                label: "Present frame",
-                colorAttachments: [{view: this.context.getCurrentTexture().createView(), loadOp: "clear", storeOp: "store", clearValue: [0, 0, 0, 1]}],
-            });
-            present.setPipeline(this.presentPipeline);
-            present.setBindGroup(0, this.presentBindGroup);
-            present.draw(3);
-            present.end();
-            this.device.queue.submit([encoder.finish()]);
-            await this.device.queue.onSubmittedWorkDone();
-            if (queryGpu) {
-                await this.timestampReadback.mapAsync(GPUMapMode.READ);
+            if (queryGpu) this.lastGpuMs = gpuMilliseconds;
+            if (sampleStats && mode === "tiled") {
+                await this.tileStatsReadback.mapAsync(GPUMapMode.READ);
                 try {
-                    const stamps = new BigUint64Array(this.timestampReadback.getMappedRange());
-                    this.lastGpuMs = Number(stamps[1] - stamps[0]) / 1e6;
+                    const values = new Uint32Array(this.tileStatsReadback.getMappedRange());
+                    this.lastTileStats = {tileCount: values[0], overflowTileCount: values[1], fallbackTileCount: values[1],
+                        fallbackTiles: values[1], candidateCountSum: values[2], maxCandidates: values[3], tiePixelCount: values[4], tileCapacity};
                 } finally {
-                    this.timestampReadback.unmap();
+                    this.tileStatsReadback.unmap();
                 }
             }
         } finally {
@@ -299,7 +393,8 @@ export class WebGpuRayRenderer {
         }
         this.assertAvailable();
         this.frameCount++;
-        return {renderMs: performance.now() - start, width, height, gpuMs: this.lastGpuMs, gpuMeasuredThisFrame: queryGpu};
+        return {renderMs: performance.now() - start, width, height, gpuMs: this.lastGpuMs, gpuMeasuredThisFrame: queryGpu,
+            mode, stripCount, tileStats: mode === "tiled" ? this.lastTileStats : null};
     }
 
     async readPixels() {
@@ -331,13 +426,23 @@ export class WebGpuRayRenderer {
         if (this.disposed) return;
         this.disposed = true;
         this.modelBuffers.forEach(buffer => buffer.destroy());
+        this.modelBuffers = [];
         this.uniformBuffer?.destroy();
         this.outputTexture?.destroy();
         this.timestampQuery?.destroy();
         this.timestampResolve?.destroy();
         this.timestampReadback?.destroy();
+        this.projectedBuffer?.destroy();
+        this.tileStatsBuffer?.destroy();
+        this.tileStatsReadback?.destroy();
         this.context?.unconfigure();
         this.device.destroy();
         this.model = null;
+        this.camera = null;
+        this.computeBindGroup = null;
+        this.presentBindGroup = null;
+        this.tiledBindGroup = null;
+        this.projectBindGroup = null;
+        this.outputTexture = null;
     }
 }

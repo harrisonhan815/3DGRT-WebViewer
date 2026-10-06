@@ -13,19 +13,28 @@
     <header><strong>FullCircle</strong><span>WebGPU 光追预览</span></header>
     <label>模型<select id="model" disabled></select></label>
     <label>相机<select id="camera" disabled></select></label>
+    <label>渲染方式<select id="render-mode">
+      <option value="tiled" selected>屏幕分块光追</option>
+      <option value="bvh">原版 BVH 光追（对照）</option>
+    </select></label>
     <div class="row">
-      <label>渲染宽度<select id="resolution">
+      <label>静止渲染宽度<select id="resolution">
         <option value="320">320 px</option><option value="480">480 px</option>
         <option value="640" selected>640 px</option><option value="960">960 px</option>
         <option value="1280">1280 px</option><option value="1920">1920 px</option>
       </select></label>
       <label>视场角<input id="fov" type="number" min="20" max="120" value="70" step="1"></label>
     </div>
+    <label class="check"><input id="adaptive" type="checkbox" checked>移动时自适应分辨率</label>
+    <label>交互帧率目标<select id="target-fps">
+      <option value="30" selected>30 FPS</option><option value="60">60 FPS</option>
+    </select></label>
     <label>移动速度<input id="speed" type="range" min="-2" max="2" value="0" step="0.1"></label>
     <div class="row buttons"><button id="reset" disabled>重置视角</button><button id="save" disabled>保存图片</button></div>
     <label class="check"><input id="continuous" type="checkbox">持续渲染 / 测帧率</label>
     <p id="details">等待载入模型</p>
     <p id="stats" title="FPS 为连续完成帧率；GPU 为最近一次计算阶段采样，默认每 30 帧更新。">—</p>
+    <p id="quality" class="muted"></p>
     <p class="help">左键拖动转向 · 右键拖动平移 · 滚轮前后<br>WASD 移动 · Q/E 上下 · Shift 加速</p>
     <p id="adapter" class="muted"></p>
   </aside>

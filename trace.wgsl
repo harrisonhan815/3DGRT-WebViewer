@@ -14,6 +14,7 @@ struct Camera {
     size: vec4<u32>,         // width, height, active SH degree, node count
     thresholds: vec4<f32>,  // min response, min alpha, min transmittance, unused
     background: vec4<f32>,
+    dispatch: vec4<u32>,    // row offset, Gaussian count, tile capacity, unused
 };
 struct Gaussian {
     centerDensity: vec4<f32>,
@@ -67,21 +68,28 @@ fn canonicalVector(g: Gaussian, v: vec3<f32>) -> vec3<f32> {
 // Preserve the native instances path's custom primitive, including its
 // extra inverse squared ray length in the distance test. It is NOT an
 // analytic ellipsoid surface intersection and NOT a screen-space splat.
-fn intersectGaussian(id: u32, origin: vec3<f32>, direction: vec3<f32>, tMin: f32, tMax: f32) -> f32 {
-    let g = gaussians[id];
+fn intersectRecordDetailed(g: Gaussian, origin: vec3<f32>, direction: vec3<f32>, tMin: f32, tMax: f32) -> vec2<f32> {
     let o = canonicalVector(g, origin - g.centerDensity.xyz);
     let d = canonicalVector(g, direction);
     let radius = g.row0Radius.w;
     let gate = boxInterval(o, d, vec3<f32>(-radius), vec3<f32>(radius), tMin, tMax);
-    if (gate.x > gate.y) { return FAR; }
+    if (gate.x > gate.y) { return vec2<f32>(FAR); }
     let d2 = dot(d, d);
     let t = -dot(o, d) / d2;
-    if (t <= tMin || t >= tMax) { return FAR; }
+    if (t <= tMin || t >= tMax) { return vec2<f32>(FAR); }
     let perpendicular = cross(d * inverseSqrt(d2), o);
     // Instance rays are divided by radius in CUDA. That factor cancels
     // between numerator and denominator in this specific test.
-    if (dot(perpendicular, perpendicular) / d2 >= 9.0) { return FAR; }
-    return t;
+    if (dot(perpendicular, perpendicular) / d2 >= 9.0) { return vec2<f32>(FAR); }
+    return vec2<f32>(t, gate.x);
+}
+
+fn intersectRecord(g: Gaussian, origin: vec3<f32>, direction: vec3<f32>, tMin: f32, tMax: f32) -> f32 {
+    return intersectRecordDetailed(g, origin, direction, tMin, tMax).x;
+}
+
+fn intersectGaussian(id: u32, origin: vec3<f32>, direction: vec3<f32>, tMin: f32, tMax: f32) -> f32 {
+    return intersectRecord(gaussians[id], origin, direction, tMin, tMax);
 }
 
 // Closest 16 hits, followed by another BVH traversal if needed. There is
@@ -177,16 +185,16 @@ fn rayColor(id: u32, d: vec3<f32>) -> vec3<f32> {
     return max(c + vec3<f32>(0.5), vec3<f32>(0.0));
 }
 
-@compute @workgroup_size(8, 8)
-fn trace(@builtin(global_invocation_id) pixel: vec3<u32>) {
-    if (pixel.x >= camera.size.x || pixel.y >= camera.size.y) { return; }
-    let xy = (vec2<f32>(pixel.xy) + vec2<f32>(0.5) - vec2<f32>(camera.size.xy) * 0.5)
+fn pixelDirection(pixel: vec2<u32>) -> vec3<f32> {
+    let xy = (vec2<f32>(pixel) + vec2<f32>(0.5) - vec2<f32>(camera.size.xy) * 0.5)
         * (2.0 * camera.origin.w / f32(camera.size.y));
     // Normalize camera-space direction before its rotation, as V2 does.
     let cameraDirection = normalize(vec3<f32>(xy, 1.0));
-    let direction = camera.right.xyz * cameraDirection.x + camera.down.xyz * cameraDirection.y
+    return camera.right.xyz * cameraDirection.x + camera.down.xyz * cameraDirection.y
         + camera.forward.xyz * cameraDirection.z;
-    let origin = camera.origin.xyz;
+}
+
+fn traceRadiance(origin: vec3<f32>, direction: vec3<f32>) -> vec3<f32> {
     let scene = boxInterval(origin, direction, nodes[0].lower, nodes[0].upper, 0.0, FAR);
     var lastT = max(0.0, scene.x - EPS_T);
     var transmittance = 1.0;
@@ -214,5 +222,14 @@ fn trace(@builtin(global_invocation_id) pixel: vec3<u32>) {
     }
     // V2 displays clamp(pred_rgb, 0, 1) without applying an sRGB transfer.
     color = clamp(color + transmittance * camera.background.xyz, vec3<f32>(0.0), vec3<f32>(1.0));
-    textureStore(outputImage, vec2<i32>(pixel.xy), vec4<f32>(color, 1.0));
+    return color;
+}
+
+// Renderer also concatenates the functions above with tiled.wgsl.
+@compute @workgroup_size(8, 8)
+fn trace(@builtin(global_invocation_id) invocation: vec3<u32>) {
+    let pixel = invocation.xy + vec2<u32>(0u, camera.dispatch.x);
+    if (pixel.x >= camera.size.x || pixel.y >= camera.size.y) { return; }
+    let color = traceRadiance(camera.origin.xyz, pixelDirection(pixel));
+    textureStore(outputImage, vec2<i32>(pixel), vec4<f32>(color, 1.0));
 }
