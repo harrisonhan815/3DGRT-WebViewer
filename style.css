@@ -1,0 +1,30 @@
+:root { font-family: system-ui, sans-serif; color: #e5eaf0; background: #11161c; }
+* { box-sizing: border-box; }
+body { margin: 0; overflow: hidden; }
+canvas { display: block; width: 100vw; height: 100vh; outline: none; touch-action: none; }
+aside { position: fixed; top: 16px; left: 16px; width: 284px; padding: 18px; background: #141c25ed; border: 1px solid #374656; border-radius: 12px; max-height: calc(100vh - 32px); overflow-y: auto; }
+header { display: flex; flex-direction: column; gap: 3px; margin-bottom: 20px; }
+header strong { font-size: 21px; letter-spacing: .02em; }
+header span, .muted, .help { font-size: 12px; color: #9aabbc; }
+label { display: flex; flex-direction: column; gap: 6px; font-size: 12px; color: #adbecf; margin: 12px 0; min-width: 0; }
+select, input[type=number], button { border: 1px solid #435569; background: #202c39; color: #ecf3fa; border-radius: 6px; padding: 8px; font: inherit; min-width: 0; }
+select, input[type=number] { width: 100%; }
+button { cursor: pointer; }
+button:hover { background: #304154; }
+button:disabled, select:disabled { opacity: .45; cursor: default; }
+input { accent-color: #86bdff; }
+.row { display: flex; gap: 12px; }
+.row > * { flex: 1; }
+.buttons { margin: 16px 0; font-size: 13px; }
+.check { flex-direction: row; align-items: center; }
+p { font-size: 12px; line-height: 1.7; margin: 10px 0; }
+#stats { color: #a8d4ff; font-variant-numeric: tabular-nums; }
+#toggle { position: fixed; top: 16px; left: 316px; background: #141c25ed; }
+body.collapsed aside { display: none; }
+body.collapsed #toggle { left: 16px; }
+#loading { position: fixed; inset: 0; display: flex; flex-direction: column; align-items: center; justify-content: center; gap: 18px; background: #11161ce8; pointer-events: none; text-align: center; padding: 24px; }
+#loading[hidden], #error[hidden] { display: none; }
+#loading span { font-size: 13px; color: #9aabbc; overflow-wrap: anywhere; }
+progress { width: min(360px, 75vw); accent-color: #86bdff; }
+#error { position: fixed; bottom: 24px; left: 50%; transform: translateX(-50%); width: min(680px, 90vw); padding: 18px; border: 1px solid #be7474; border-radius: 8px; background: #351f24ee; color: #ffd9d9; white-space: pre-wrap; overflow-wrap: anywhere; font-size: 14px; }
+@media (max-width: 580px) { aside { width: 250px; } #toggle { left: 282px; } }

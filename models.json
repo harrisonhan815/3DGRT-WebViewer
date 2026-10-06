@@ -1,0 +1,15 @@
+{
+  "default": "fc-room1",
+  "models": [
+    {
+      "id": "fc-room1",
+      "name": "fc-room1",
+      "url": "models/fc-room1/manifest.json"
+    },
+    {
+      "id": "fc-lounge",
+      "name": "fc-lounge",
+      "url": "models/fc-lounge/manifest.json"
+    }
+  ]
+}

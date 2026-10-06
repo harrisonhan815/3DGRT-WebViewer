@@ -1,0 +1,37 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width,initial-scale=1">
+  <meta name="color-scheme" content="dark">
+  <title>FullCircle · WebGPU</title>
+  <link rel="stylesheet" href="./style.css">
+</head>
+<body>
+  <canvas id="view" tabindex="0" aria-label="三维场景，拖动转向，WASD 移动"></canvas>
+  <aside id="panel">
+    <header><strong>FullCircle</strong><span>WebGPU 光追预览</span></header>
+    <label>模型<select id="model" disabled></select></label>
+    <label>相机<select id="camera" disabled></select></label>
+    <div class="row">
+      <label>渲染宽度<select id="resolution">
+        <option value="320">320 px</option><option value="480">480 px</option>
+        <option value="640" selected>640 px</option><option value="960">960 px</option>
+        <option value="1280">1280 px</option><option value="1920">1920 px</option>
+      </select></label>
+      <label>视场角<input id="fov" type="number" min="20" max="120" value="70" step="1"></label>
+    </div>
+    <label>移动速度<input id="speed" type="range" min="-2" max="2" value="0" step="0.1"></label>
+    <div class="row buttons"><button id="reset" disabled>重置视角</button><button id="save" disabled>保存图片</button></div>
+    <label class="check"><input id="continuous" type="checkbox">持续渲染 / 测帧率</label>
+    <p id="details">等待载入模型</p>
+    <p id="stats" title="FPS 为连续完成帧率；GPU 为最近一次计算阶段采样，默认每 30 帧更新。">—</p>
+    <p class="help">左键拖动转向 · 右键拖动平移 · 滚轮前后<br>WASD 移动 · Q/E 上下 · Shift 加速</p>
+    <p id="adapter" class="muted"></p>
+  </aside>
+  <button id="toggle" aria-label="展开或收起控制栏">☰</button>
+  <div id="loading" role="status"><strong id="load-title">正在初始化 WebGPU</strong><progress id="progress"></progress><span id="load-detail">模型将在本机显卡上渲染</span></div>
+  <div id="error" role="alert" hidden></div>
+  <script type="module" src="./main.js"></script>
+</body>
+</html>
