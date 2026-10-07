@@ -14,7 +14,7 @@ struct Camera {
     size: vec4<u32>,         // width, height, active SH degree, node count
     thresholds: vec4<f32>,  // min response, min alpha, min transmittance, unused
     background: vec4<f32>,
-    dispatch: vec4<u32>,    // row offset, Gaussian count, tile capacity, unused
+    dispatch: vec4<u32>,    // row offset, Gaussian count, tile capacity, projection (0 perspective, 1 equidistant fisheye)
 };
 struct Gaussian {
     centerDensity: vec4<f32>,
@@ -186,6 +186,20 @@ fn rayColor(id: u32, d: vec3<f32>) -> vec3<f32> {
 }
 
 fn pixelDirection(pixel: vec2<u32>) -> vec3<f32> {
+    if (camera.dispatch.w == 1u) {
+        // Generic 180-degree equidistant lens: the circle rim is theta=pi/2.
+        // It is a projection comparison, not an X4 calibration/distortion fit.
+        let imageRadius = 0.5 * f32(min(camera.size.x, camera.size.y));
+        let normalizedPixel = (vec2<f32>(pixel) + 0.5 - vec2<f32>(camera.size.xy) * 0.5) / imageRadius;
+        let radius = length(normalizedPixel);
+        var cameraDirection = vec3<f32>(0.0, 0.0, 1.0);
+        if (radius > 1e-8) {
+            let theta = radius * 1.5707963267948966;
+            cameraDirection = vec3<f32>(normalizedPixel * (sin(theta) / radius), cos(theta));
+        }
+        return camera.right.xyz * cameraDirection.x + camera.down.xyz * cameraDirection.y
+            + camera.forward.xyz * cameraDirection.z;
+    }
     let xy = (vec2<f32>(pixel) + vec2<f32>(0.5) - vec2<f32>(camera.size.xy) * 0.5)
         * (2.0 * camera.origin.w / f32(camera.size.y));
     // Normalize camera-space direction before its rotation, as V2 does.
@@ -230,6 +244,14 @@ fn traceRadiance(origin: vec3<f32>, direction: vec3<f32>) -> vec3<f32> {
 fn trace(@builtin(global_invocation_id) invocation: vec3<u32>) {
     let pixel = invocation.xy + vec2<u32>(0u, camera.dispatch.x);
     if (pixel.x >= camera.size.x || pixel.y >= camera.size.y) { return; }
+    if (camera.dispatch.w == 1u) {
+        let offset = vec2<f32>(pixel) + 0.5 - vec2<f32>(camera.size.xy) * 0.5;
+        let imageRadius = 0.5 * f32(min(camera.size.x, camera.size.y));
+        if (dot(offset, offset) > imageRadius * imageRadius) {
+            textureStore(outputImage, vec2<i32>(pixel), vec4<f32>(0.0, 0.0, 0.0, 1.0));
+            return;
+        }
+    }
     let color = traceRadiance(camera.origin.xyz, pixelDirection(pixel));
     textureStore(outputImage, vec2<i32>(pixel), vec4<f32>(color, 1.0));
 }

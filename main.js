@@ -3,11 +3,14 @@ import { AdaptiveResolution } from './adaptive-resolution.js';
 
 const $ = (id) => document.getElementById(id);
 const canvas = $('view');
+const previewCanvas = $('fisheye-view');
 let renderer, manifest, camera, worldUp, ready = false, loading = false, dirty = true, rendered = false;
 let catalog = [], currentId = '', loadController, busy = false, capturing = false, baseSpeed = 1;
 let frameTimes = [], previousFrame = 0, lastUiUpdate = 0;
 let stopped = false, animationFrame = null;
 let rendererInitialization = null, exitPromise = null;
+let cameraRevision = 0, mainRevision = -1, previewRevision = -1;
+let lastMainCamera = null, lastInteraction = -Infinity;
 const keys = new Set();
 const adaptive = new AdaptiveResolution();
 
@@ -68,6 +71,9 @@ async function safeExit() {
       $('camera').replaceChildren();
       canvas.width = canvas.height = 1;
       canvas.hidden = true;
+      $('fisheye-panel').hidden = true;
+      previewCanvas.width = previewCanvas.height = 1;
+      lastMainCamera = null;
       panel.dataset.state = 'closed';
       panel.setAttribute('aria-busy', 'false');
       $('exit-title').textContent = '已安全退出';
@@ -117,6 +123,30 @@ function message(error) {
   $('error').textContent = error instanceof Error ? error.message : String(error);
   $('error').hidden = false;
 }
+
+function markCameraChanged(moving = false) {
+  cameraRevision++;
+  dirty = true;
+  if (moving) lastInteraction = performance.now();
+  if ($('fisheye-enabled').checked) {
+    $('fisheye-status').textContent = moving ? '移动中，停止后更新' : '等待当前视角';
+  }
+}
+
+function copyCamera(value) {
+  return {
+    position: [...value.position], right: [...value.right], down: [...value.down],
+    forward: [...value.forward], tanHalfFovY: value.tanHalfFovY,
+  };
+}
+
+function invalidatePreview() {
+  previewRevision = -1;
+  mainRevision = -1;
+  lastMainCamera = null;
+  previewCanvas.hidden = true;
+  $('fisheye-status').textContent = '等待当前视角';
+}
 function applyPreset(index) {
   const p = manifest.cameras[index];
   const r = p.rotation;
@@ -130,7 +160,8 @@ function applyPreset(index) {
   worldUp = camera.down.map((x) => -x);
   $('fov').value = (p.fov_y * 180 / Math.PI).toFixed(1);
   adaptive.reset();
-  dirty = true;
+  lastInteraction = -Infinity;
+  markCameraChanged();
 }
 
 async function fetchJson(url, signal) {
@@ -186,6 +217,7 @@ async function switchModel(entry) {
   loading = true;
   ready = false;
   rendered = false;
+  invalidatePreview();
   keys.clear();
   $('model').disabled = $('camera').disabled = $('save').disabled = $('reset').disabled = true;
   $('error').hidden = true;
@@ -255,11 +287,12 @@ function move(direction, distance) {
   if (distance === 0) return;
   camera.position = camera.position.map((v, i) => v + direction[i]*distance);
   adaptive.markMotion(performance.now());
-  dirty = true;
+  markCameraChanged(true);
 }
 function turn(dx, dy) {
   if (dx === 0 && dy === 0) return;
-  const yaw = -dx * 0.003, pitch = dy * 0.003;
+  // Match the existing pan interaction: dragging right moves the scene right.
+  const yaw = dx * 0.003, pitch = dy * 0.003;
   for (const key of ['right', 'down', 'forward']) camera[key] = rotate(camera[key], worldUp, yaw);
   const right = [...camera.right];
   for (const key of ['down', 'forward']) camera[key] = rotate(camera[key], right, pitch);
@@ -267,7 +300,7 @@ function turn(dx, dy) {
   camera.right = norm(cross(camera.down, camera.forward));
   camera.down = norm(cross(camera.forward, camera.right));
   adaptive.markMotion(performance.now());
-  dirty = true;
+  markCameraChanged(true);
 }
 
 let drag;
@@ -299,7 +332,7 @@ window.addEventListener('keydown', (e) => {
 window.addEventListener('keyup', (e) => keys.delete(e.code));
 window.addEventListener('blur', () => { keys.clear(); drag = null; });
 document.addEventListener('visibilitychange', () => { keys.clear(); frameTimes = []; dirty = true; });
-window.addEventListener('resize', () => { adaptive.markMotion(performance.now()); dirty = true; });
+window.addEventListener('resize', () => { adaptive.markMotion(performance.now()); markCameraChanged(true); });
 $('resolution').addEventListener('change', () => { frameTimes = []; dirty = true; });
 $('adaptive').addEventListener('change', () => { frameTimes = []; dirty = true; });
 $('target-fps').addEventListener('change', () => { adaptive.setTarget(Number($('target-fps').value)); dirty = true; });
@@ -310,7 +343,18 @@ $('fov').addEventListener('change', () => {
   $('fov').value = value;
   camera.tanHalfFovY = Math.tan(value*Math.PI/360);
   adaptive.markMotion(performance.now());
-  dirty = true;
+  markCameraChanged(true);
+});
+$('fisheye-enabled').addEventListener('change', () => {
+  $('fisheye-panel').hidden = !$('fisheye-enabled').checked;
+  if ($('fisheye-enabled').checked) {
+    previewRevision = -1;
+    $('fisheye-status').textContent = '等待当前视角';
+  }
+});
+$('fisheye-hide').addEventListener('click', () => {
+  $('fisheye-enabled').checked = false;
+  $('fisheye-panel').hidden = true;
 });
 $('model').addEventListener('change', () => switchModel(catalog.find((e) => e.id === $('model').value)));
 $('camera').addEventListener('change', () => { keys.clear(); applyPreset(Number($('camera').value)); });
@@ -360,11 +404,15 @@ async function frame(time) {
     if (dirty || $('continuous').checked || renderer.width !== width || renderer.height !== height || restoreFull) {
       dirty = false; busy = true;
       try {
-        renderer.setCamera(camera);
+        const frameCamera = copyCamera(camera);
+        const frameRevision = cameraRevision;
+        renderer.setCamera(frameCamera);
         const mode = $('render-mode').value;
         const modeLabel = $('render-mode').selectedOptions[0].textContent;
         const result = await renderer.render({ width, height, mode });
         if (stopped) return;
+        lastMainCamera = frameCamera;
+        mainRevision = frameRevision;
         adaptive.record(result, choice.moving);
         canvas.dataset.quality = choice.moving ? 'moving' : 'full';
         rendered = true;
@@ -382,6 +430,38 @@ async function frame(time) {
     } else if (frameTimes.length && time-frameTimes.at(-1) > 1000) {
       frameTimes = [];
       $('stats').textContent = $('stats').textContent.replace(/ · [\d.]+ FPS$/, '') + ' · 静止';
+    }
+  }
+  // The comparison uses the exact pose of the completed main frame. Never
+  // add a fisheye render to every moving frame on a resource-limited device.
+  if (ready && !loading && !capturing && !stopped && !document.hidden && !dirty
+      && $('fisheye-enabled').checked && lastMainCamera && mainRevision === cameraRevision
+      && previewRevision !== mainRevision && performance.now() - lastInteraction >= 200) {
+    busy = true;
+    const revision = mainRevision;
+    $('fisheye-status').textContent = '正在更新鱼眼视角…';
+    // Keep the canvas in layout before acquiring its presentation surface.
+    previewCanvas.hidden = false;
+    try {
+      const result = await renderer.renderPreview(previewCanvas, {width:192, height:192, camera:lastMainCamera});
+      if (stopped) return;
+      if (!loading && revision === cameraRevision && $('fisheye-enabled').checked) {
+        previewRevision = revision;
+        previewCanvas.hidden = false;
+        previewCanvas.dataset.revision = String(revision);
+        $('fisheye-status').textContent = `与主视角同位姿 · ${result.renderMs.toFixed(1)} ms`;
+      } else if ($('fisheye-enabled').checked) {
+        $('fisheye-status').textContent = '移动中，停止后更新';
+      }
+    } catch (error) {
+      if (!stopped) {
+        $('fisheye-enabled').checked = false;
+        previewCanvas.hidden = true;
+        $('fisheye-status').textContent = '鱼眼预览不可用，可重新开启';
+        console.warn('Fisheye preview stopped:', error);
+      }
+    } finally {
+      busy = false;
     }
   }
   scheduleFrame();

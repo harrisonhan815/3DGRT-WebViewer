@@ -23,6 +23,12 @@ p { font-size: 12px; line-height: 1.7; margin: 10px 0; }
 #toggle { position: fixed; top: 16px; left: 316px; background: #141c25ed; }
 #safe-exit { position: fixed; top: 16px; right: 16px; z-index: 2; background: #372b30; border-color: #916b76; }
 #safe-exit:hover:enabled { background: #51363e; }
+#fisheye-panel { position: fixed; right: 16px; bottom: 16px; width: clamp(160px, 24vw, 224px); padding: 10px; background: #141c25ed; border: 1px solid #435569; border-radius: 10px; }
+#fisheye-panel[hidden] { display: none; }
+.fisheye-heading { display: flex; align-items: center; justify-content: space-between; gap: 8px; margin-bottom: 8px; font-size: 12px; }
+#fisheye-hide { padding: 0 6px; border: 0; background: transparent; font-size: 20px; }
+#fisheye-view { width: 100%; height: auto; aspect-ratio: 1; border-radius: 6px; background: #000; }
+#fisheye-status { margin: 6px 0 0; color: #adbecf; font-size: 11px; }
 #exit-panel { position: fixed; inset: 0; z-index: 3; display: flex; flex-direction: column; align-items: center; justify-content: center; padding: 32px; text-align: center; background: #11161c; outline: none; }
 #exit-panel[hidden] { display: none; }
 #exit-title { font-size: 22px; }

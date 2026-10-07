@@ -84,6 +84,8 @@ export class WebGpuRayRenderer {
         this.width = 0;
         this.height = 0;
         this.model = null;
+        this.modelRevision = 0;
+        this.previewTarget = null;
         this.camera = null;
         this.disposed = false;
         this.closing = false;
@@ -213,6 +215,7 @@ export class WebGpuRayRenderer {
         this.modelBuffers = nextBuffers;
         this.projectedBuffer = nextProjected;
         this.model = {...metadata, render: {...render, background}};
+        this.modelRevision++;
         this.lastGpuMs = null;
         this.lastTileStats = null;
         this.frameCount = 0;
@@ -400,11 +403,160 @@ export class WebGpuRayRenderer {
             mode, stripCount, tileStats: mode === "tiled" ? this.lastTileStats : null};
     }
 
+    ensurePreviewTarget(canvas, width, height) {
+        exactInteger(width, "preview width");
+        exactInteger(height, "preview height");
+        const limit = this.device.limits.maxTextureDimension2D;
+        if (width > limit || height > limit) throw new Error(`Preview dimensions exceed this GPU's ${limit}px texture limit.`);
+        if (canvas === this.canvas) throw new Error("The preview needs a separate canvas.");
+        if (this.previewTarget && this.previewTarget.canvas !== canvas) this.destroyPreviewTarget();
+        if (!this.previewTarget) {
+            const context = canvas.getContext("webgpu");
+            if (!context) throw new Error("Unable to create the WebGPU preview canvas context.");
+            context.configure({device: this.device, format: this.format, alphaMode: "opaque", colorSpace: "srgb"});
+            this.previewTarget = {
+                canvas, context, width: 0, height: 0, boundRevision: -1, renderedRevision: -1,
+                uniformData: new ArrayBuffer(128),
+                uniformBuffer: this.device.createBuffer({
+                    label: "3DGRT preview camera", size: 128,
+                    usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST,
+                }),
+            };
+        }
+        const target = this.previewTarget;
+        if (target.width !== width || target.height !== height) {
+            target.texture?.destroy();
+            target.width = canvas.width = width;
+            target.height = canvas.height = height;
+            target.texture = this.device.createTexture({
+                label: "3DGRT fisheye preview image", size: [width, height], format: "rgba8unorm",
+                usage: GPUTextureUsage.STORAGE_BINDING | GPUTextureUsage.TEXTURE_BINDING | GPUTextureUsage.COPY_SRC,
+            });
+            target.boundRevision = -1;
+            target.renderedRevision = -1;
+        }
+        if (target.boundRevision !== this.modelRevision) {
+            target.computeBindGroup = this.device.createBindGroup({
+                layout: this.computePipeline.getBindGroupLayout(0),
+                entries: [
+                    {binding: 0, resource: {buffer: target.uniformBuffer}},
+                    ...this.modelBuffers.map((buffer, i) => ({binding: i + 1, resource: {buffer}})),
+                    {binding: 4, resource: target.texture.createView()},
+                ],
+            });
+            target.presentBindGroup = this.device.createBindGroup({
+                layout: this.presentPipeline.getBindGroupLayout(0),
+                entries: [{binding: 0, resource: target.texture.createView()}],
+            });
+            target.boundRevision = this.modelRevision;
+        }
+        return target;
+    }
+
+    async renderPreview(canvas, {width = 192, height = 192, camera = this.camera, measureGpu = false} = {}) {
+        this.assertAvailable();
+        if (!this.model || !camera) throw new Error("Load a model and provide a camera before rendering a preview.");
+        if (this.rendering) throw new Error("Wait for the current render before rendering a preview.");
+        const pose = {
+            position: finiteVector(camera.position, 3, "preview camera.position"),
+            right: finiteVector(camera.right, 3, "preview camera.right"),
+            down: finiteVector(camera.down, 3, "preview camera.down"),
+            forward: finiteVector(camera.forward, 3, "preview camera.forward"),
+        };
+        this.rendering = true;
+        const started = performance.now();
+        const queryGpu = Boolean(measureGpu && this.timestampQuery);
+        let gpuMilliseconds = 0;
+        let stripCount = 0;
+        this.device.pushErrorScope("validation");
+        try {
+            const target = this.ensurePreviewTarget(canvas, width, height);
+            target.renderedRevision = -1;
+            const floats = new Float32Array(target.uniformData);
+            const uints = new Uint32Array(target.uniformData);
+            const settings = this.model.render;
+            floats.fill(0);
+            floats.set([...pose.position, 1], 0);
+            floats.set(pose.right, 4);
+            floats.set(pose.down, 8);
+            floats.set(pose.forward, 12);
+            uints.set([width, height, settings.sh_degree, this.model.bvh_node_count], 16);
+            floats.set([settings.min_response, settings.min_alpha, settings.min_transmittance, 0], 20);
+            floats.set(settings.background, 24);
+            const stripRows = Math.max(8, Math.floor(Math.min(height, 131072 / width) / 8) * 8);
+            for (let row = 0; row < height; row += stripRows) {
+                this.assertAvailable();
+                const rows = Math.min(stripRows, height - row);
+                const last = row + rows === height;
+                // Perspective tile bounds are invalid for a 180-degree lens.
+                // The preview deliberately uses the exact BVH reference path.
+                uints.set([row, this.model.gaussian_count, 0, 1], 28);
+                this.device.queue.writeBuffer(target.uniformBuffer, 0, target.uniformData);
+                const encoder = this.device.createCommandEncoder({label: "3DGRT fisheye preview"});
+                const descriptor = {label: "180-degree equidistant BVH tracing"};
+                if (queryGpu) descriptor.timestampWrites = {
+                    querySet: this.timestampQuery, beginningOfPassWriteIndex: 0, endOfPassWriteIndex: 1,
+                };
+                const compute = encoder.beginComputePass(descriptor);
+                compute.setPipeline(this.computePipeline);
+                compute.setBindGroup(0, target.computeBindGroup);
+                compute.dispatchWorkgroups(Math.ceil(width / 8), Math.ceil(rows / 8));
+                compute.end();
+                if (queryGpu) {
+                    encoder.resolveQuerySet(this.timestampQuery, 0, 2, this.timestampResolve, 0);
+                    encoder.copyBufferToBuffer(this.timestampResolve, 0, this.timestampReadback, 0, 16);
+                }
+                if (last) {
+                    const present = encoder.beginRenderPass({
+                        label: "Present completed fisheye preview",
+                        colorAttachments: [{view: target.context.getCurrentTexture().createView(), loadOp: "clear", storeOp: "store", clearValue: [0, 0, 0, 1]}],
+                    });
+                    present.setPipeline(this.presentPipeline);
+                    present.setBindGroup(0, target.presentBindGroup);
+                    present.draw(3);
+                    present.end();
+                }
+                this.device.queue.submit([encoder.finish()]);
+                await this.device.queue.onSubmittedWorkDone();
+                this.assertAvailable();
+                if (queryGpu) {
+                    await this.timestampReadback.mapAsync(GPUMapMode.READ);
+                    try {
+                        const stamps = new BigUint64Array(this.timestampReadback.getMappedRange());
+                        gpuMilliseconds += Number(stamps[1] - stamps[0]) / 1e6;
+                    } finally {
+                        this.timestampReadback.unmap();
+                    }
+                }
+                stripCount++;
+            }
+            target.renderedRevision = this.modelRevision;
+        } finally {
+            this.rendering = false;
+            const error = await this.device.popErrorScope();
+            if (error) throw new Error(`WebGPU preview failed: ${error.message}`);
+        }
+        this.assertAvailable();
+        return {renderMs: performance.now() - started, gpuMs: queryGpu ? gpuMilliseconds : null,
+            width, height, stripCount, projection: "fisheye-equidistant", mode: "bvh"};
+    }
+
     async readPixels() {
         this.assertAvailable();
         if (this.rendering) throw new Error("Wait for the current render before reading pixels.");
         if (!this.outputTexture) throw new Error("Render a frame before reading pixels.");
-        const {width, height} = this;
+        return this.readTexturePixels(this.outputTexture, this.width, this.height);
+    }
+
+    async readPreviewPixels() {
+        this.assertAvailable();
+        if (this.rendering) throw new Error("Wait for the current render before reading preview pixels.");
+        const target = this.previewTarget;
+        if (!target || target.renderedRevision !== this.modelRevision) throw new Error("Render a preview for the current model before reading preview pixels.");
+        return this.readTexturePixels(target.texture, target.width, target.height);
+    }
+
+    async readTexturePixels(texture, width, height) {
         const bytesPerRow = Math.ceil(width * 4 / 256) * 256;
         const buffer = this.device.createBuffer({
             label: "3DGRT validation readback", size: bytesPerRow * height,
@@ -412,7 +564,7 @@ export class WebGpuRayRenderer {
         });
         try {
             const encoder = this.device.createCommandEncoder();
-            encoder.copyTextureToBuffer({texture: this.outputTexture}, {buffer, bytesPerRow, rowsPerImage: height}, [width, height]);
+            encoder.copyTextureToBuffer({texture}, {buffer, bytesPerRow, rowsPerImage: height}, [width, height]);
             this.device.queue.submit([encoder.finish()]);
             await buffer.mapAsync(GPUMapMode.READ);
             const source = new Uint8Array(buffer.getMappedRange());
@@ -450,6 +602,15 @@ export class WebGpuRayRenderer {
         return this.shutdownPromise;
     }
 
+    destroyPreviewTarget() {
+        const target = this.previewTarget;
+        if (!target) return;
+        target.uniformBuffer.destroy();
+        target.texture?.destroy();
+        target.context.unconfigure();
+        this.previewTarget = null;
+    }
+
     dispose() {
         if (this.disposed) return;
         this.disposed = true;
@@ -463,6 +624,7 @@ export class WebGpuRayRenderer {
         this.projectedBuffer?.destroy();
         this.tileStatsBuffer?.destroy();
         this.tileStatsReadback?.destroy();
+        this.destroyPreviewTarget();
         this.context?.unconfigure();
         this.device.destroy();
         this.model = null;
