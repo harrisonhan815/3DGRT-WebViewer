@@ -39,8 +39,13 @@
     <p id="adapter" class="muted"></p>
   </aside>
   <button id="toggle" aria-label="展开或收起控制栏">☰</button>
+  <button id="safe-exit" type="button" title="停止渲染并清理资源后关闭页面">安全退出</button>
   <div id="loading" role="status"><strong id="load-title">正在初始化 WebGPU</strong><progress id="progress"></progress><span id="load-detail">模型将在本机显卡上渲染</span></div>
   <div id="error" role="alert" hidden></div>
+  <section id="exit-panel" role="status" aria-live="polite" tabindex="-1" hidden>
+    <strong id="exit-title">正在安全退出</strong>
+    <p id="exit-status"></p>
+  </section>
   <script type="module" src="./main.js"></script>
 </body>
 </html>

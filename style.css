@@ -2,6 +2,7 @@
 * { box-sizing: border-box; }
 body { margin: 0; overflow: hidden; }
 canvas { display: block; width: 100vw; height: 100vh; outline: none; touch-action: none; }
+canvas[hidden] { display: none; }
 aside { position: fixed; top: 16px; left: 16px; width: 284px; padding: 18px; background: #141c25ed; border: 1px solid #374656; border-radius: 12px; max-height: calc(100vh - 32px); overflow-y: auto; }
 header { display: flex; flex-direction: column; gap: 3px; margin-bottom: 20px; }
 header strong { font-size: 21px; letter-spacing: .02em; }
@@ -20,6 +21,12 @@ input { accent-color: #86bdff; }
 p { font-size: 12px; line-height: 1.7; margin: 10px 0; }
 #stats { color: #a8d4ff; font-variant-numeric: tabular-nums; }
 #toggle { position: fixed; top: 16px; left: 316px; background: #141c25ed; }
+#safe-exit { position: fixed; top: 16px; right: 16px; z-index: 2; background: #372b30; border-color: #916b76; }
+#safe-exit:hover:enabled { background: #51363e; }
+#exit-panel { position: fixed; inset: 0; z-index: 3; display: flex; flex-direction: column; align-items: center; justify-content: center; padding: 32px; text-align: center; background: #11161c; outline: none; }
+#exit-panel[hidden] { display: none; }
+#exit-title { font-size: 22px; }
+#exit-status { max-width: 520px; color: #adbecf; font-size: 15px; }
 body.collapsed aside { display: none; }
 body.collapsed #toggle { left: 16px; }
 #loading { position: fixed; inset: 0; display: flex; flex-direction: column; align-items: center; justify-content: center; gap: 18px; background: #11161ce8; pointer-events: none; text-align: center; padding: 24px; }

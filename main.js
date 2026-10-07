@@ -7,10 +7,11 @@ let renderer, manifest, camera, worldUp, ready = false, loading = false, dirty =
 let catalog = [], currentId = '', loadController, busy = false, capturing = false, baseSpeed = 1;
 let frameTimes = [], previousFrame = 0, lastUiUpdate = 0;
 let stopped = false, animationFrame = null;
+let rendererInitialization = null, exitPromise = null;
 const keys = new Set();
 const adaptive = new AdaptiveResolution();
 
-function stopViewer() {
+function haltViewer() {
   if (stopped) return;
   stopped = true;
   ready = false;
@@ -18,8 +19,79 @@ function stopViewer() {
   if (animationFrame !== null) cancelAnimationFrame(animationFrame);
   animationFrame = null;
   loadController?.abort();
+}
+
+function stopViewer() {
+  haltViewer();
+  // pagehide can arrive while the explicit exit button is waiting for a
+  // fence; disposal must still run even if scheduling has already stopped.
   renderer?.dispose();
 }
+
+async function safeExit() {
+  if (exitPromise) return exitPromise;
+  haltViewer();
+  const button = $('safe-exit');
+  button.disabled = true;
+  button.textContent = '正在退出…';
+  for (const input of document.querySelectorAll('#panel button, #panel input, #panel select, #toggle')) input.disabled = true;
+  $('loading').hidden = true;
+  $('error').hidden = true;
+  const panel = $('exit-panel');
+  panel.hidden = false;
+  panel.dataset.state = 'closing';
+  panel.setAttribute('aria-busy', 'true');
+  $('exit-title').textContent = '正在安全退出';
+  $('exit-status').textContent = '已停止渲染和下载，正在等待显卡完成当前工作…';
+  panel.focus();
+  exitPromise = (async () => {
+    let initializationTimer;
+    try {
+      // The button is also available while the first device is initializing.
+      // main() disposes a late-created device when it sees stopped=true.
+      const activeRenderer = renderer ?? await Promise.race([
+        rendererInitialization?.catch(() => null) ?? Promise.resolve(null),
+        new Promise((_, reject) => {
+          initializationTimer = setTimeout(() => reject(new Error('GPU initialization did not finish.')), 8000);
+        }),
+      ]);
+      clearTimeout(initializationTimer);
+      await activeRenderer?.shutdown();
+      renderer = null;
+      rendererInitialization = null;
+      manifest = null;
+      camera = null;
+      worldUp = null;
+      catalog = [];
+      frameTimes = [];
+      $('model').replaceChildren();
+      $('camera').replaceChildren();
+      canvas.width = canvas.height = 1;
+      canvas.hidden = true;
+      panel.dataset.state = 'closed';
+      panel.setAttribute('aria-busy', 'false');
+      $('exit-title').textContent = '已安全退出';
+      $('exit-status').textContent = '资源已释放，可以手动关闭此标签页。';
+      button.textContent = '已退出';
+      // Normal user-opened tabs may reject close(). Keep the cleared page
+      // and an honest manual-close message; do not use close-policy tricks.
+      try { window.close(); } catch { /* Browser requires manual closing. */ }
+    } catch (error) {
+      renderer?.dispose();
+      panel.dataset.state = 'error';
+      panel.setAttribute('aria-busy', 'false');
+      $('exit-title').textContent = '渲染已停止';
+      $('exit-status').textContent = '已请求清理资源，但未能确认显卡完成当前工作。请手动关闭此标签页。';
+      button.textContent = '已停止';
+      console.warn('Safe exit could not confirm GPU completion:', error);
+    } finally {
+      clearTimeout(initializationTimer);
+    }
+  })();
+  return exitPromise;
+}
+
+$('safe-exit').addEventListener('click', safeExit);
 
 // pagehide covers navigation and back/forward-cache entry without adding an
 // unload listener. Restoring a cached page must create a new WebGPU device.
@@ -317,7 +389,8 @@ async function frame(time) {
 
 async function main() {
   if (!isSecureContext || !navigator.gpu) throw new Error('此页面需要支持 WebGPU 的浏览器，并通过 HTTPS 或 localhost 打开。请使用启用了硬件加速的 Chrome / Edge。');
-  renderer = await WebGpuRayRenderer.create(canvas);
+  rendererInitialization = WebGpuRayRenderer.create(canvas);
+  renderer = await rendererInitialization;
   if (stopped) { renderer.dispose(); return; }
   const info = renderer.adapterInfo || {};
   $('adapter').textContent = [info.vendor, info.architecture, info.device, info.description].filter(Boolean).join(' · ') || 'WebGPU · 本机显卡';

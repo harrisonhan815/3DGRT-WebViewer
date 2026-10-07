@@ -86,6 +86,8 @@ export class WebGpuRayRenderer {
         this.model = null;
         this.camera = null;
         this.disposed = false;
+        this.closing = false;
+        this.shutdownPromise = null;
         this.rendering = false;
         this.lostReason = null;
         this.frameCount = 0;
@@ -140,6 +142,7 @@ export class WebGpuRayRenderer {
 
     assertAvailable() {
         if (this.disposed) throw new Error("Renderer has been disposed.");
+        if (this.closing) throw new DOMException("Renderer is shutting down.", "AbortError");
         if (this.lostReason) throw new Error(`WebGPU device lost: ${this.lostReason} Reload the page to reconnect.`);
     }
 
@@ -422,6 +425,31 @@ export class WebGpuRayRenderer {
         }
     }
 
+    shutdown({timeoutMs = 8000} = {}) {
+        if (this.shutdownPromise) return this.shutdownPromise;
+        if (this.disposed) return Promise.resolve();
+        // Stop asynchronous render/upload continuations before placing a
+        // queue fence. A running strip may finish, but no next strip starts.
+        this.closing = true;
+        this.shutdownPromise = (async () => {
+            let timer;
+            try {
+                if (this.lostReason) throw new Error(this.lostReason);
+                await Promise.race([
+                    this.device.queue.onSubmittedWorkDone(),
+                    new Promise((_, reject) => {
+                        timer = setTimeout(() => reject(new Error("Timed out waiting for the GPU to finish.")), timeoutMs);
+                    }),
+                ]);
+                if (this.lostReason) throw new Error(this.lostReason);
+            } finally {
+                clearTimeout(timer);
+                this.dispose();
+            }
+        })();
+        return this.shutdownPromise;
+    }
+
     dispose() {
         if (this.disposed) return;
         this.disposed = true;
@@ -444,5 +472,9 @@ export class WebGpuRayRenderer {
         this.tiledBindGroup = null;
         this.projectBindGroup = null;
         this.outputTexture = null;
+        this.computePipeline = null;
+        this.tiledPipeline = null;
+        this.projectPipeline = null;
+        this.presentPipeline = null;
     }
 }
