@@ -1,5 +1,6 @@
 import { WebGpuRayRenderer } from './renderer.js';
 import { AdaptiveResolution } from './adaptive-resolution.js';
+import { createAlignment, loadAlignment, levelCamera, ALIGNMENT_SCHEMA } from './alignment.js';
 
 const $ = (id) => document.getElementById(id);
 const canvas = $('view');
@@ -11,6 +12,7 @@ let stopped = false, animationFrame = null;
 let rendererInitialization = null, exitPromise = null;
 let cameraRevision = 0, mainRevision = -1, previewRevision = -1;
 let lastMainCamera = null, lastInteraction = -Infinity;
+let alignmentState = null, modelManifestUrl = null, alignmentSaving = false, alignmentSaveController = null;
 const keys = new Set();
 const adaptive = new AdaptiveResolution();
 
@@ -22,6 +24,7 @@ function haltViewer() {
   if (animationFrame !== null) cancelAnimationFrame(animationFrame);
   animationFrame = null;
   loadController?.abort();
+  alignmentSaveController?.abort();
 }
 
 function stopViewer() {
@@ -74,6 +77,8 @@ async function safeExit() {
       $('fisheye-panel').hidden = true;
       previewCanvas.width = previewCanvas.height = 1;
       lastMainCamera = null;
+      alignmentState = null;
+      modelManifestUrl = null;
       panel.dataset.state = 'closed';
       panel.setAttribute('aria-busy', 'false');
       $('exit-title').textContent = '已安全退出';
@@ -147,6 +152,47 @@ function invalidatePreview() {
   previewCanvas.hidden = true;
   $('fisheye-status').textContent = '等待当前视角';
 }
+
+function alignmentStatus(state,text) {
+  if (stopped) return;
+  $('align-status').dataset.state = state;
+  $('align-status').textContent = text;
+}
+
+function updateAlignmentControls() {
+  $('align-enabled').checked = Boolean(alignmentState?.enabled);
+  $('align-roll').value = alignmentState?.angles_deg.roll ?? 0;
+  $('align-pitch').value = alignmentState?.angles_deg.pitch ?? 0;
+  for (const id of ['align-enabled','align-roll','align-pitch','align-reset','align-save']) {
+    $(id).disabled = !ready || loading || stopped || alignmentSaving;
+  }
+}
+
+function applyManualAlignment() {
+  if (!ready || loading || stopped || alignmentSaving) return;
+  if (!$('align-enabled').checked) {
+    const angles = alignmentState?.angles_deg ?? {roll:0,pitch:0};
+    alignmentState = createAlignment(manifest,currentId,angles.roll,angles.pitch,false);
+    updateAlignmentControls();
+    applyPreset(Number($('camera').value));
+    alignmentStatus('modified','校正已关闭，尚未保存');
+    return;
+  }
+  if ($('align-roll').value === '' || $('align-pitch').value === '') return;
+  try {
+    alignmentState = createAlignment(manifest,currentId,Number($('align-roll').value),Number($('align-pitch').value),$('align-enabled').checked);
+    if (alignmentState.enabled) {
+      worldUp = [...alignmentState.up];
+      camera = levelCamera(camera,worldUp);
+      markCameraChanged();
+    } else {
+      applyPreset(Number($('camera').value));
+    }
+    alignmentStatus('modified','校正已修改，尚未保存');
+  } catch (error) {
+    alignmentStatus('warning',error.message);
+  }
+}
 function applyPreset(index) {
   const p = manifest.cameras[index];
   const r = p.rotation;
@@ -158,6 +204,10 @@ function applyPreset(index) {
     tanHalfFovY: Math.tan(p.fov_y / 2),
   };
   worldUp = camera.down.map((x) => -x);
+  if (alignmentState?.enabled) {
+    worldUp = [...alignmentState.up];
+    camera = levelCamera(camera,worldUp);
+  }
   $('fov').value = (p.fov_y * 180 / Math.PI).toFixed(1);
   adaptive.reset();
   lastInteraction = -Infinity;
@@ -217,6 +267,11 @@ async function switchModel(entry) {
   loading = true;
   ready = false;
   rendered = false;
+  alignmentSaveController?.abort();
+  alignmentState = null;
+  modelManifestUrl = null;
+  updateAlignmentControls();
+  alignmentStatus('loading','正在检查模型校正文件…');
   invalidatePreview();
   keys.clear();
   $('model').disabled = $('camera').disabled = $('save').disabled = $('reset').disabled = true;
@@ -245,13 +300,19 @@ async function switchModel(entry) {
       $('progress').value = received;
       $('load-detail').textContent = `${(received / 1048576).toFixed(1)} / ${(total / 1048576).toFixed(1)} MiB`;
     };
-    const [geometry, sh, bvh] = await Promise.all(['geometry', 'sh', 'bvh'].map((key) => loadBuffer(m.files[key], base, loadController.signal, onBytes)));
+    const [geometry, sh, bvh, calibration] = await Promise.all([
+      ...['geometry', 'sh', 'bvh'].map((key) => loadBuffer(m.files[key], base, loadController.signal, onBytes)),
+      loadAlignment(base,m,loadController.signal),
+    ]);
     if (stopped) return;
     $('load-detail').textContent = '上传到本机显卡';
     await renderer.loadModel({ geometry, sh, bvh, metadata: m });
     if (stopped) return;
     manifest = m;
     currentId = entry.id;
+    modelManifestUrl = base;
+    alignmentState = calibration.alignment ?? createAlignment(m,entry.id);
+    alignmentStatus(calibration.state,calibration.message);
     $('camera').replaceChildren(...m.cameras.map((p, i) => new Option(p.name || `相机 ${i}`, i)));
     $('camera').value = String(m.default_camera || 0);
     applyPreset(Number($('camera').value));
@@ -279,6 +340,7 @@ async function switchModel(entry) {
       $('model').disabled = false;
       $('camera').disabled = $('reset').disabled = !ready;
       $('save').disabled = !ready || !rendered;
+      updateAlignmentControls();
     }
   }
 }
@@ -359,6 +421,71 @@ $('fisheye-hide').addEventListener('click', () => {
 $('model').addEventListener('change', () => switchModel(catalog.find((e) => e.id === $('model').value)));
 $('camera').addEventListener('change', () => { keys.clear(); applyPreset(Number($('camera').value)); });
 $('reset').addEventListener('click', () => applyPreset(Number($('camera').value)));
+$('align-enabled').addEventListener('change', applyManualAlignment);
+for (const id of ['align-roll','align-pitch']) $(id).addEventListener('input', () => {
+  if (!ready || loading || alignmentSaving) return;
+  $('align-enabled').checked = true;
+  applyManualAlignment();
+});
+$('align-reset').addEventListener('click', () => {
+  if (!ready || loading || stopped || alignmentSaving) return;
+  alignmentState = createAlignment(manifest,currentId);
+  updateAlignmentControls();
+  applyPreset(Number($('camera').value));
+  alignmentStatus('modified','已恢复当前预设原始姿态；保存后才会覆盖旧校正文件');
+});
+$('align-save').addEventListener('click', async () => {
+  if (!ready || loading || stopped || alignmentSaving || !modelManifestUrl) return;
+  let correction;
+  try {
+    if ($('align-roll').value === '' || $('align-pitch').value === '') throw new Error('请填写校正角度');
+    correction = createAlignment(manifest,currentId,Number($('align-roll').value),Number($('align-pitch').value),$('align-enabled').checked);
+  } catch (error) { alignmentStatus('warning',error.message); return; }
+  alignmentSaving = true;
+  alignmentSaveController = new AbortController();
+  const signal = alignmentSaveController.signal;
+  const target = new URL(modelManifestUrl);
+  const savingId = currentId;
+  updateAlignmentControls();
+  alignmentStatus('saving','正在保存校正…');
+  try {
+    const pageBase = new URL('.',document.baseURI);
+    let writable = false;
+    if (target.origin === pageBase.origin && target.pathname.startsWith(pageBase.pathname)) {
+      try {
+        const response = await fetch(new URL('__viewer__/capabilities',pageBase),{signal,credentials:'omit',cache:'no-store'});
+        if (response.ok && response.headers.get('content-type')?.includes('application/json')) {
+          const capabilities = await response.json();
+          writable = capabilities.alignment_write === true && capabilities.alignment_schema === ALIGNMENT_SCHEMA;
+        }
+      } catch (error) { if (signal.aborted) throw error; }
+    }
+    if (stopped || signal.aborted || savingId !== currentId || loading) return;
+    if (writable) {
+      const response = await fetch(new URL('__viewer__/alignment',pageBase),{
+        method:'POST',signal,credentials:'omit',headers:{'Content-Type':'application/json'},
+        body:JSON.stringify({model:decodeURIComponent(target.pathname.slice(pageBase.pathname.length)),alignment:correction}),
+      });
+      const result = await response.json();
+      if (!response.ok || result.saved !== true) throw new Error(result.error || `服务器未确认保存（HTTP ${response.status}）`);
+      if (stopped || signal.aborted || savingId !== currentId || loading) return;
+      alignmentStatus('saved','已保存到模型目录的 alignment.json；下次加载自动读取');
+    } else {
+      const blob = new Blob([JSON.stringify(correction,null,2)+'\n'],{type:'application/json'});
+      const url = URL.createObjectURL(blob);
+      const link = document.createElement('a');
+      link.href = url; link.download = 'alignment.json';
+      document.body.appendChild(link); link.click(); link.remove();
+      setTimeout(() => URL.revokeObjectURL(url),1000);
+      alignmentStatus('downloaded',`已导出 alignment.json，请放入 ${currentId} 模型目录并发布；静态页面不能直接写服务器`);
+    }
+  } catch (error) {
+    if (!stopped && !signal.aborted && savingId === currentId && !loading) alignmentStatus('warning',`保存失败：${error.message}`);
+  } finally {
+    alignmentSaving = false;
+    if (!stopped) updateAlignmentControls();
+  }
+});
 $('toggle').addEventListener('click', () => document.body.classList.toggle('collapsed'));
 $('continuous').addEventListener('change', () => { frameTimes = []; dirty = true; });
 $('save').addEventListener('click', async () => {

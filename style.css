@@ -18,6 +18,10 @@ input { accent-color: #86bdff; }
 .row > * { flex: 1; }
 .buttons { margin: 16px 0; font-size: 13px; }
 .check { flex-direction: row; align-items: center; }
+#alignment-controls { margin: 14px 0; padding: 10px; border: 1px solid #374656; border-radius: 6px; }
+#alignment-controls summary { cursor: pointer; font-size: 13px; color: #c4d7eb; }
+#align-status { color: #aacbed; }
+#align-status[data-state=warning] { color: #ffc68a; }
 p { font-size: 12px; line-height: 1.7; margin: 10px 0; }
 #stats { color: #a8d4ff; font-variant-numeric: tabular-nums; }
 #toggle { position: fixed; top: 16px; left: 316px; background: #141c25ed; }

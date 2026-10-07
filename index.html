@@ -13,6 +13,17 @@
     <header><strong>3DGRT Viewer</strong><span>WebGPU 光追预览</span></header>
     <label>模型<select id="model" disabled></select></label>
     <label>相机<select id="camera" disabled></select></label>
+    <details id="alignment-controls">
+      <summary>手动水平 / 竖直校正</summary>
+      <label class="check"><input id="align-enabled" type="checkbox" disabled>应用统一竖直方向</label>
+      <div class="row">
+        <label>左右倾斜（°）<input id="align-roll" type="number" min="-180" max="180" step="0.1" value="0" disabled></label>
+        <label>前后倾斜（°）<input id="align-pitch" type="number" min="-89" max="89" step="0.1" value="0" disabled></label>
+      </div>
+      <div class="row buttons"><button id="align-reset" disabled>恢复原始</button><button id="align-save" disabled>保存校正</button></div>
+      <p class="help">角度以模型首个相机为参考。调整前后倾斜时，可转动视角检查墙面竖直方向。</p>
+      <p id="align-status" role="status" aria-live="polite" data-state="absent">等待模型</p>
+    </details>
     <label>渲染方式<select id="render-mode">
       <option value="bvh" selected>BVH 光追</option>
       <option value="tiled">屏幕分块光追</option>
