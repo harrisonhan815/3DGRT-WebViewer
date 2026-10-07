@@ -1,6 +1,7 @@
 import { WebGpuRayRenderer } from './renderer.js';
 import { AdaptiveResolution } from './adaptive-resolution.js';
-import { createAlignment, loadAlignment, levelCamera, ALIGNMENT_SCHEMA } from './alignment.js';
+import { createFrameAlignment, frameFromAlignment, defaultFrame, applyAlignment, alignmentUp, loadAlignment, ALIGNMENT_SCHEMA } from './alignment.js';
+import { AlignmentGizmo } from './alignment-gizmo.js';
 
 const $ = (id) => document.getElementById(id);
 const canvas = $('view');
@@ -13,8 +14,27 @@ let rendererInitialization = null, exitPromise = null;
 let cameraRevision = 0, mainRevision = -1, previewRevision = -1;
 let lastMainCamera = null, lastInteraction = -Infinity;
 let alignmentState = null, modelManifestUrl = null, alignmentSaving = false, alignmentSaveController = null;
+let gizmoFrame = null, calibrationDragging = false;
 const keys = new Set();
 const adaptive = new AdaptiveResolution();
+const gizmo = new AlignmentGizmo($('alignment-overlay'), {
+  onChange: (frame,event) => {
+    if (stopped || !ready || loading || alignmentSaving) return;
+    gizmoFrame = {origin:[...frame.origin],rotation:frame.rotation.map(row=>[...row])};
+    if (event.phase === 'end') {
+      commitGizmoFrame();
+    } else if (event.phase === 'change') {
+      alignmentStatus('editing','正在拖动参考地面；松开后应用观察中心与上方向');
+    } else if (event.phase === 'cancel') {
+      alignmentStatus('modified','已取消本次拖动');
+    }
+  },
+  onDragState: (active) => {
+    calibrationDragging = active;
+    if (active) { keys.clear(); drag = null; }
+    if (!stopped) updateAlignmentControls();
+  },
+});
 
 function haltViewer() {
   if (stopped) return;
@@ -25,6 +45,7 @@ function haltViewer() {
   animationFrame = null;
   loadController?.abort();
   alignmentSaveController?.abort();
+  gizmo.dispose();
 }
 
 function stopViewer() {
@@ -161,33 +182,31 @@ function alignmentStatus(state,text) {
 
 function updateAlignmentControls() {
   $('align-enabled').checked = Boolean(alignmentState?.enabled);
-  $('align-roll').value = alignmentState?.angles_deg.roll ?? 0;
-  $('align-pitch').value = alignmentState?.angles_deg.pitch ?? 0;
-  for (const id of ['align-enabled','align-roll','align-pitch','align-reset','align-save']) {
-    $(id).disabled = !ready || loading || stopped || alignmentSaving;
+  for (const id of ['align-tool','align-enabled','align-center','align-reset','align-save']) {
+    $(id).disabled = !ready || loading || stopped || alignmentSaving || calibrationDragging;
   }
+  updateGizmo();
 }
 
-function applyManualAlignment() {
-  if (!ready || loading || stopped || alignmentSaving) return;
-  if (!$('align-enabled').checked) {
-    const angles = alignmentState?.angles_deg ?? {roll:0,pitch:0};
-    alignmentState = createAlignment(manifest,currentId,angles.roll,angles.pitch,false);
-    updateAlignmentControls();
-    applyPreset(Number($('camera').value));
-    alignmentStatus('modified','校正已关闭，尚未保存');
-    return;
-  }
-  if ($('align-roll').value === '' || $('align-pitch').value === '') return;
+function updateGizmo() {
+  if (stopped) return;
+  gizmo.setState({camera,frame:gizmoFrame,visible:Boolean(ready && !loading && $('align-tool').checked),
+    enabled:Boolean(ready && !loading && !alignmentSaving),sizePx:105});
+}
+
+function commitGizmoFrame(enabled = true) {
+  if (!ready || loading || stopped || alignmentSaving || !gizmoFrame) return;
   try {
-    alignmentState = createAlignment(manifest,currentId,Number($('align-roll').value),Number($('align-pitch').value),$('align-enabled').checked);
-    if (alignmentState.enabled) {
-      worldUp = [...alignmentState.up];
-      camera = levelCamera(camera,worldUp);
-      markCameraChanged();
+    alignmentState = createFrameAlignment(manifest,currentId,gizmoFrame,enabled);
+    if (enabled) {
+      worldUp = alignmentUp(alignmentState);
+      camera = applyAlignment(camera,alignmentState);
+      adaptive.markMotion(performance.now());
+      markCameraChanged(true);
     } else {
       applyPreset(Number($('camera').value));
     }
+    updateAlignmentControls();
     alignmentStatus('modified','校正已修改，尚未保存');
   } catch (error) {
     alignmentStatus('warning',error.message);
@@ -205,13 +224,14 @@ function applyPreset(index) {
   };
   worldUp = camera.down.map((x) => -x);
   if (alignmentState?.enabled) {
-    worldUp = [...alignmentState.up];
-    camera = levelCamera(camera,worldUp);
+    worldUp = alignmentUp(alignmentState);
+    camera = applyAlignment(camera,alignmentState);
   }
   $('fov').value = (p.fov_y * 180 / Math.PI).toFixed(1);
   adaptive.reset();
   lastInteraction = -Infinity;
   markCameraChanged();
+  updateGizmo();
 }
 
 async function fetchJson(url, signal) {
@@ -269,6 +289,7 @@ async function switchModel(entry) {
   rendered = false;
   alignmentSaveController?.abort();
   alignmentState = null;
+  gizmoFrame = null;
   modelManifestUrl = null;
   updateAlignmentControls();
   alignmentStatus('loading','正在检查模型校正文件…');
@@ -311,7 +332,8 @@ async function switchModel(entry) {
     manifest = m;
     currentId = entry.id;
     modelManifestUrl = base;
-    alignmentState = calibration.alignment ?? createAlignment(m,entry.id);
+    alignmentState = calibration.alignment ?? createFrameAlignment(m,entry.id);
+    gizmoFrame = frameFromAlignment(alignmentState,m);
     alignmentStatus(calibration.state,calibration.message);
     $('camera').replaceChildren(...m.cameras.map((p, i) => new Option(p.name || `相机 ${i}`, i)));
     $('camera').value = String(m.default_camera || 0);
@@ -368,7 +390,7 @@ function turn(dx, dy) {
 let drag;
 canvas.addEventListener('contextmenu', (e) => e.preventDefault());
 canvas.addEventListener('pointerdown', (e) => {
-  if (!ready || drag) return;
+  if (!ready || drag || calibrationDragging) return;
   canvas.focus();
   canvas.setPointerCapture(e.pointerId);
   drag = { x: e.clientX, y: e.clientY, pan: e.button === 2 || e.shiftKey, id: e.pointerId };
@@ -385,7 +407,7 @@ canvas.addEventListener('pointermove', (e) => {
 for (const name of ['pointerup', 'pointercancel', 'lostpointercapture']) canvas.addEventListener(name, () => { drag = null; });
 canvas.addEventListener('wheel', (e) => {
   e.preventDefault();
-  if (ready) move(camera.forward, -Math.sign(e.deltaY)*baseSpeed*Math.pow(10, Number($('speed').value))*0.2);
+  if (ready && !calibrationDragging) move(camera.forward, -Math.sign(e.deltaY)*baseSpeed*Math.pow(10, Number($('speed').value))*0.2);
 }, { passive: false });
 window.addEventListener('keydown', (e) => {
   if (e.target !== canvas) return;
@@ -394,7 +416,7 @@ window.addEventListener('keydown', (e) => {
 window.addEventListener('keyup', (e) => keys.delete(e.code));
 window.addEventListener('blur', () => { keys.clear(); drag = null; });
 document.addEventListener('visibilitychange', () => { keys.clear(); frameTimes = []; dirty = true; });
-window.addEventListener('resize', () => { adaptive.markMotion(performance.now()); markCameraChanged(true); });
+window.addEventListener('resize', () => { adaptive.markMotion(performance.now()); markCameraChanged(true); updateGizmo(); });
 $('resolution').addEventListener('change', () => { frameTimes = []; dirty = true; });
 $('adaptive').addEventListener('change', () => { frameTimes = []; dirty = true; });
 $('target-fps').addEventListener('change', () => { adaptive.setTarget(Number($('target-fps').value)); dirty = true; });
@@ -421,25 +443,30 @@ $('fisheye-hide').addEventListener('click', () => {
 $('model').addEventListener('change', () => switchModel(catalog.find((e) => e.id === $('model').value)));
 $('camera').addEventListener('change', () => { keys.clear(); applyPreset(Number($('camera').value)); });
 $('reset').addEventListener('click', () => applyPreset(Number($('camera').value)));
-$('align-enabled').addEventListener('change', applyManualAlignment);
-for (const id of ['align-roll','align-pitch']) $(id).addEventListener('input', () => {
-  if (!ready || loading || alignmentSaving) return;
-  $('align-enabled').checked = true;
-  applyManualAlignment();
+$('align-enabled').addEventListener('change', () => commitGizmoFrame($('align-enabled').checked));
+$('align-tool').addEventListener('change', updateGizmo);
+$('align-center').addEventListener('click', () => {
+  if (!ready || loading || stopped || alignmentSaving || calibrationDragging) return;
+  const placed = defaultFrame(manifest,camera);
+  if (gizmoFrame) placed.rotation = gizmoFrame.rotation.map(row=>[...row]);
+  gizmoFrame = placed;
+  $('align-tool').checked = true;
+  commitGizmoFrame();
 });
 $('align-reset').addEventListener('click', () => {
-  if (!ready || loading || stopped || alignmentSaving) return;
-  alignmentState = createAlignment(manifest,currentId);
-  updateAlignmentControls();
+  if (!ready || loading || stopped || alignmentSaving || calibrationDragging) return;
+  alignmentState = createFrameAlignment(manifest,currentId);
   applyPreset(Number($('camera').value));
+  gizmoFrame = defaultFrame(manifest,camera);
+  alignmentState = createFrameAlignment(manifest,currentId,gizmoFrame,false);
+  updateAlignmentControls();
   alignmentStatus('modified','已恢复当前预设原始姿态；保存后才会覆盖旧校正文件');
 });
 $('align-save').addEventListener('click', async () => {
-  if (!ready || loading || stopped || alignmentSaving || !modelManifestUrl) return;
+  if (!ready || loading || stopped || alignmentSaving || calibrationDragging || !modelManifestUrl || !gizmoFrame) return;
   let correction;
   try {
-    if ($('align-roll').value === '' || $('align-pitch').value === '') throw new Error('请填写校正角度');
-    correction = createAlignment(manifest,currentId,Number($('align-roll').value),Number($('align-pitch').value),$('align-enabled').checked);
+    correction = createFrameAlignment(manifest,currentId,gizmoFrame,$('align-enabled').checked);
   } catch (error) { alignmentStatus('warning',error.message); return; }
   alignmentSaving = true;
   alignmentSaveController = new AbortController();
@@ -456,7 +483,7 @@ $('align-save').addEventListener('click', async () => {
         const response = await fetch(new URL('__viewer__/capabilities',pageBase),{signal,credentials:'omit',cache:'no-store'});
         if (response.ok && response.headers.get('content-type')?.includes('application/json')) {
           const capabilities = await response.json();
-          writable = capabilities.alignment_write === true && capabilities.alignment_schema === ALIGNMENT_SCHEMA;
+          writable = capabilities.alignment_write === true && (capabilities.alignment_schema === ALIGNMENT_SCHEMA || capabilities.alignment_schemas?.includes(ALIGNMENT_SCHEMA));
         }
       } catch (error) { if (signal.aborted) throw error; }
     }
@@ -477,7 +504,7 @@ $('align-save').addEventListener('click', async () => {
       link.href = url; link.download = 'alignment.json';
       document.body.appendChild(link); link.click(); link.remove();
       setTimeout(() => URL.revokeObjectURL(url),1000);
-      alignmentStatus('downloaded',`已导出 alignment.json，请放入 ${currentId} 模型目录并发布；静态页面不能直接写服务器`);
+      alignmentStatus('downloaded',`已导出 alignment.json，请放入 ${currentId} 模型目录并发布；当前服务未提供此版本的写入接口`);
     }
   } catch (error) {
     if (!stopped && !signal.aborted && savingId === currentId && !loading) alignmentStatus('warning',`保存失败：${error.message}`);
@@ -514,7 +541,7 @@ async function frame(time) {
   animationFrame = null;
   if (stopped) return;
   const dt = Math.min((time-previousFrame)/1000 || 0, 0.1); previousFrame = time;
-  if (ready && !loading && !capturing && !document.hidden) {
+  if (ready && !loading && !capturing && !calibrationDragging && !document.hidden) {
     const speed = baseSpeed * Math.pow(10, Number($('speed').value)) * dt * (keys.has('ShiftLeft') || keys.has('ShiftRight') ? 3 : 1);
     if (keys.has('KeyW')) move(camera.forward, speed);
     if (keys.has('KeyS')) move(camera.forward, -speed);
@@ -540,6 +567,7 @@ async function frame(time) {
         if (stopped) return;
         lastMainCamera = frameCamera;
         mainRevision = frameRevision;
+        updateGizmo();
         adaptive.record(result, choice.moving);
         canvas.dataset.quality = choice.moving ? 'moving' : 'full';
         rendered = true;
@@ -561,7 +589,7 @@ async function frame(time) {
   }
   // The comparison uses the exact pose of the completed main frame. Never
   // add a fisheye render to every moving frame on a resource-limited device.
-  if (ready && !loading && !capturing && !stopped && !document.hidden && !dirty
+  if (ready && !loading && !capturing && !calibrationDragging && !stopped && !document.hidden && !dirty
       && $('fisheye-enabled').checked && lastMainCamera && mainRevision === cameraRevision
       && previewRevision !== mainRevision && performance.now() - lastInteraction >= 200) {
     busy = true;

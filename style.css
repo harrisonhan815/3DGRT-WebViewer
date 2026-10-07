@@ -20,6 +20,9 @@ input { accent-color: #86bdff; }
 .check { flex-direction: row; align-items: center; }
 #alignment-controls { margin: 14px 0; padding: 10px; border: 1px solid #374656; border-radius: 6px; }
 #alignment-controls summary { cursor: pointer; font-size: 13px; color: #c4d7eb; }
+#alignment-overlay { position: fixed; inset: 0; z-index: 1; pointer-events: none; }
+#panel, #toggle, #fisheye-panel { z-index: 2; }
+#align-center { width: 100%; }
 #align-status { color: #aacbed; }
 #align-status[data-state=warning] { color: #ffc68a; }
 p { font-size: 12px; line-height: 1.7; margin: 10px 0; }

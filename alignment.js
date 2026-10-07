@@ -1,6 +1,7 @@
 // Calibration stays in the model's original coordinate system. Only the
 // viewing camera and navigation up axis change; Gaussian/SH/BVH stay intact.
-export const ALIGNMENT_SCHEMA = 'fullcircle-viewer-alignment-v1';
+export const ALIGNMENT_SCHEMA = 'fullcircle-viewer-alignment-v2';
+export const LEGACY_ALIGNMENT_SCHEMA = 'fullcircle-viewer-alignment-v1';
 const dot = (a,b) => a.reduce((sum,value,i) => sum+value*b[i],0);
 const cross = (a,b) => [a[1]*b[2]-a[2]*b[1],a[2]*b[0]-a[0]*b[2],a[0]*b[1]-a[1]*b[0]];
 const vector = (value,label) => {
@@ -30,7 +31,7 @@ export function upFromAngles(manifest,roll,pitch) {
 
 export function createAlignment(manifest,modelId,roll=0,pitch=0,enabled=false) {
   const value={
-    schema:ALIGNMENT_SCHEMA, model_id:modelId, source:manifest.source,
+    schema:LEGACY_ALIGNMENT_SCHEMA, model_id:modelId, source:manifest.source,
     gaussian_count:manifest.gaussian_count,
     model_bounds:{min:[...manifest.bounds.min],max:[...manifest.bounds.max]},
     enabled, reference_camera:0, angles_deg:{roll,pitch},
@@ -40,21 +41,90 @@ export function createAlignment(manifest,modelId,roll=0,pitch=0,enabled=false) {
 }
 
 export function validateAlignment(value,manifest) {
-  if (!value || value.schema!==ALIGNMENT_SCHEMA) throw new Error('不支持此校正文件格式');
+  if (!value || ![ALIGNMENT_SCHEMA,LEGACY_ALIGNMENT_SCHEMA].includes(value.schema)) throw new Error('不支持此校正文件格式');
   if (typeof value.model_id!=='string' || !value.model_id.trim() || value.model_id.length>200) throw new Error('校正文件缺少模型标识');
   if (typeof value.source!=='string' || value.source!==manifest.source
       || !Number.isSafeInteger(value.gaussian_count) || value.gaussian_count!==manifest.gaussian_count) throw new Error('校正文件与当前模型不匹配');
-  if (typeof value.enabled!=='boolean' || value.reference_camera!==0) throw new Error('校正文件的开关或参考相机无效');
+  if (typeof value.enabled!=='boolean') throw new Error('校正文件的开关无效');
   for (const key of ['min','max']) {
     const saved=vector(value.model_bounds?.[key],'校正模型范围');
     const actual=vector(manifest.bounds?.[key],'模型范围');
     if (saved.some((v,i)=>Math.abs(v-actual[i])>1e-6*Math.max(1,Math.abs(actual[i])))) throw new Error('校正文件的模型坐标范围不匹配');
   }
+  if (value.schema===ALIGNMENT_SCHEMA) {
+    const fields=['schema','model_id','source','gaussian_count','model_bounds','enabled','origin','rotation'];
+    if (Object.keys(value).length!==fields.length || fields.some(key=>!(key in value))) throw new Error('地平面校正文件包含未知或缺失字段');
+    const origin=vector(value.origin,'地平面原点');
+    if (origin.some(v=>Math.abs(v)>=1e12)) throw new Error('地平面原点超出支持范围');
+    const rotation=value.rotation;
+    if (!Array.isArray(rotation) || rotation.length!==3) throw new Error('地平面旋转必须为 3×3 矩阵');
+    rotation.forEach(row=>vector(row,'地平面旋转'));
+    const axes=[0,1,2].map(i=>rotation.map(row=>row[i]));
+    if (axes.some(a=>Math.abs(dot(a,a)-1)>1e-4)
+        || Math.abs(dot(axes[0],axes[1]))>1e-4 || Math.abs(dot(axes[0],axes[2]))>1e-4 || Math.abs(dot(axes[1],axes[2]))>1e-4
+        || Math.abs(dot(cross(axes[0],axes[1]),axes[2])-1)>1e-4) throw new Error('地平面必须是正交旋转，不能包含缩放、剪切或镜像');
+    return {...value,origin,rotation:rotation.map(row=>[...row]),model_bounds:{min:[...value.model_bounds.min],max:[...value.model_bounds.max]}};
+  }
+  if (value.reference_camera!==0) throw new Error('校正文件的参考相机无效');
   const up=vector(value.up,'竖直方向');
   if (Math.abs(Math.hypot(...up)-1)>1e-4) throw new Error('校正竖直方向必须为单位向量');
   const expected=upFromAngles(manifest,value.angles_deg?.roll,value.angles_deg?.pitch);
   if (up.some((v,i)=>Math.abs(v-expected[i])>1e-4)) throw new Error('校正方向与角度不一致');
   return {...value, up:[...up],angles_deg:{...value.angles_deg},model_bounds:{min:[...value.model_bounds.min],max:[...value.model_bounds.max]}};
+}
+
+export function frameDistance(manifest,camera) {
+  const distances=(manifest.cameras??[]).map(p=>Math.hypot(...p.position.map((v,i)=>v-camera.position[i])))
+    .filter(d=>Number.isFinite(d)&&d>1e-6).sort((a,b)=>a-b);
+  if (distances.length>2) return Math.max(1e-3,distances[Math.floor(distances.length/2)]*0.3);
+  return Math.max(1e-3,Math.hypot(...manifest.bounds.max.map((v,i)=>v-manifest.bounds.min[i]))*0.2);
+}
+
+export function referenceCamera(manifest) {
+  const p=manifest.cameras[0];
+  return {position:[...p.position],right:p.rotation.map(r=>r[0]),down:p.rotation.map(r=>r[1]),forward:p.rotation.map(r=>r[2])};
+}
+
+export function defaultFrame(manifest,camera=referenceCamera(manifest),below=true) {
+  const up=normalize(camera.down.map(v=>-v));
+  const right=levelCamera(camera,up).right;
+  const back=normalize(cross(right,up));
+  const distance=frameDistance(manifest,camera);
+  return {
+    origin:camera.position.map((v,i)=>v+camera.forward[i]*distance+(below?camera.down[i]*distance*0.35:0)),
+    rotation:[0,1,2].map(i=>[right[i],up[i],back[i]]),
+  };
+}
+
+export function frameFromAlignment(value,manifest) {
+  if (value.schema===ALIGNMENT_SCHEMA) return {origin:[...value.origin],rotation:value.rotation.map(row=>[...row])};
+  const frame=defaultFrame(manifest,referenceCamera(manifest),false);
+  const up=normalize(value.up);
+  const right=levelCamera(referenceCamera(manifest),up).right;
+  const back=normalize(cross(right,up));
+  frame.rotation=[0,1,2].map(i=>[right[i],up[i],back[i]]);
+  return frame;
+}
+
+export function createFrameAlignment(manifest,modelId,frame=defaultFrame(manifest),enabled=false) {
+  return validateAlignment({schema:ALIGNMENT_SCHEMA,model_id:modelId,source:manifest.source,
+    gaussian_count:manifest.gaussian_count,model_bounds:{min:[...manifest.bounds.min],max:[...manifest.bounds.max]},
+    enabled,origin:[...frame.origin],rotation:frame.rotation.map(row=>[...row])},manifest);
+}
+
+export function alignmentUp(value) {
+  return value.schema===ALIGNMENT_SCHEMA?value.rotation.map(row=>row[1]):[...value.up];
+}
+
+export function applyAlignment(camera,value) {
+  if (!value?.enabled) return camera;
+  let result=camera;
+  if (value.schema===ALIGNMENT_SCHEMA) {
+    const offset=value.origin.map((v,i)=>v-camera.position[i]);
+    // A pivot exactly at the eye cannot define a look-at direction.
+    if (Math.hypot(...offset)>1e-8) result={...camera,forward:normalize(offset)};
+  }
+  return levelCamera(result,alignmentUp(value));
 }
 
 export function levelCamera(camera,sceneUp) {
