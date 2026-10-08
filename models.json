@@ -10,6 +10,11 @@
       "id": "fc-lounge",
       "name": "fc-lounge",
       "url": "models/fc-lounge/manifest.json"
+    },
+    {
+      "id": "fc-lounge-aligned",
+      "name": "fc-lounge-aligned",
+      "url": "models/fc-lounge-aligned/manifest.json"
     }
   ]
 }
