@@ -12,7 +12,7 @@ struct Camera {
     down: vec4<f32>,
     forward: vec4<f32>,
     size: vec4<u32>,         // width, height, active SH degree, node count
-    thresholds: vec4<f32>,  // min response, min alpha, min transmittance, unused
+    thresholds: vec4<f32>,  // min response, min alpha, min transmittance, SH packed-half flag
     background: vec4<f32>,
     dispatch: vec4<u32>,    // row offset, Gaussian count, tile capacity, projection (0 perspective, 1 equidistant fisheye)
 };
@@ -35,7 +35,9 @@ struct HitBatch {
 };
 @group(0) @binding(0) var<uniform> camera: Camera;
 @group(0) @binding(1) var<storage, read> gaussians: array<Gaussian>;
-@group(0) @binding(2) var<storage, read> sh: array<f32>;
+// u32 preserves either an original f32 bit pattern or two packed binary16
+// values. unpack2x16float returns f32 and needs no shader-f16 feature.
+@group(0) @binding(2) var<storage, read> sh: array<u32>;
 @group(0) @binding(3) var<storage, read> nodes: array<Node>;
 @group(0) @binding(4) var outputImage: texture_storage_2d<rgba8unorm, write>;
 
@@ -153,7 +155,15 @@ fn traceBatch(origin: vec3<f32>, direction: vec3<f32>, tMin: f32, tMax: f32) -> 
 
 fn coefficient(id: u32, index: u32) -> vec3<f32> {
     let offset = id * 48u + index * 3u;
-    return vec3<f32>(sh[offset], sh[offset + 1u], sh[offset + 2u]);
+    if (camera.thresholds.w > 0.5) {
+        // RGB triples alternate between even and odd half-word starts.
+        // At SH index 15 the odd path ends at half 47, within this Gaussian.
+        let first = unpack2x16float(sh[offset / 2u]);
+        let second = unpack2x16float(sh[offset / 2u + 1u]);
+        if ((offset & 1u) == 0u) { return vec3<f32>(first.x, first.y, second.x); }
+        return vec3<f32>(first.y, second.x, second.y);
+    }
+    return vec3<f32>(bitcast<f32>(sh[offset]), bitcast<f32>(sh[offset + 1u]), bitcast<f32>(sh[offset + 2u]));
 }
 
 fn rayColor(id: u32, d: vec3<f32>) -> vec3<f32> {

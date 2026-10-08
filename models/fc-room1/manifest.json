@@ -30233,7 +30233,7 @@
   ],
   "default_camera": 0,
   "camera_source": "COLMAP training poses, perspective preview",
-  "precision": "float32, no quantization or pruning",
+  "precision": "geometry storage float32; SH storage float16 (quantized); BVH float32/u32; no additional pruning",
   "byte_order": "little-endian",
   "native_support": {
     "bound": "density-clamped transformed cube (native instances)",
@@ -30251,31 +30251,48 @@
   "files": {
     "geometry": {
       "byteLength": 12252800,
+      "downloadByteLength": 9772467,
       "stride": 64,
       "parts": [
         {
-          "path": "geometry.000.bin",
-          "byteLength": 12252800
+          "path": "geometry.000.bin.shuf.gz",
+          "byteLength": 12252800,
+          "downloadByteLength": 9772467,
+          "compression": "gzip",
+          "transform": "byte-shuffle-4",
+          "sha256": "7fea4b95d1606d2de7d9e7e0de8a975da4e09a905877578c45c333888396fb64"
         }
       ]
     },
     "sh": {
-      "byteLength": 36758400,
-      "stride": 192,
+      "byteLength": 18379200,
+      "downloadByteLength": 15674245,
+      "stride": 96,
       "parts": [
         {
-          "path": "sh.000.bin",
-          "byteLength": 36758400
+          "path": "sh.000.bin.shuf.gz",
+          "byteLength": 18379200,
+          "downloadByteLength": 15674245,
+          "compression": "gzip",
+          "transform": "byte-shuffle-2",
+          "sha256": "904762c9e7cdf1879bdaca722cb8e5d59c43aa0170fab79ce9bcbe626d13f543"
         }
-      ]
+      ],
+      "dtype": "float16",
+      "quantization_dtype": "float16"
     },
     "bvh": {
       "byteLength": 2262880,
+      "downloadByteLength": 1404996,
       "stride": 32,
       "parts": [
         {
-          "path": "bvh.000.bin",
-          "byteLength": 2262880
+          "path": "bvh.000.bin.shuf.gz",
+          "byteLength": 2262880,
+          "downloadByteLength": 1404996,
+          "compression": "gzip",
+          "transform": "byte-shuffle-4",
+          "sha256": "bf3a3ab86754ec7054b20c4463567493554ca9edbdc26dc9dd0a7241a615cce8"
         }
       ]
     }

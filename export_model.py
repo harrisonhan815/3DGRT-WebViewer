@@ -4,18 +4,22 @@
 Only CPU PyTorch, NumPy and OmegaConf are required; this module never imports
 the training model, CUDA extensions, OptiX, or a web server. Checkpoints use
 Python pickle and must be trusted local files. Exporting does not prune,
-quantize, downsample or modify the source checkpoint.
+downsample or modify the source checkpoint. SH defaults to float32 and can
+explicitly be quantized to float16; geometry and BVH retain their original bits.
 
 Geometry: 64 bytes/particle, four little-endian float32 vec4 records:
   [center.xyz, activated_density], [world_to_local_row0.xyz, kernel_radius],
   [world_to_local_row1.xyz, 0], [world_to_local_row2.xyz, 0].
-SH: 192 bytes/particle, 16 RGB float32 coefficients (DC first).
+SH: 192 bytes/particle (float32) or 96 bytes/particle (float16),
+  16 RGB coefficients with DC first, in the same order for both types.
 BVH: 32 bytes/node, [min.xyz, left:u32], [max.xyz, right_or_count:u32].
   Internal nodes hold two node indices. Leaves set count's high bit and use
   left as the first particle index. All particle buffers follow leaf order.
 """
 
 import argparse
+import gzip
+import hashlib
 import importlib.util
 import json
 import math
@@ -23,6 +27,7 @@ from pathlib import Path
 import shutil
 import sys
 import tempfile
+import zlib
 
 import numpy as np
 
@@ -410,8 +415,139 @@ def export_cameras(checkpoint, positions, camera_json=None, data_path=None, fov_
     ], source
 
 
-def write_parts(directory, name, array, stride, max_bytes):
-    """Write record-aligned chunks; a logical buffer can be concatenated verbatim."""
+COMPRESSION_MODES = ("none", "gzip", "gzip-shuffle")
+MAX_PART_BYTES = 100 * 1024 * 1024
+SH_DTYPES = {"float32": np.dtype("<f4"), "float16": np.dtype("<f2")}
+
+
+def convert_sh_bytes(data, source_dtype, target_dtype):
+    """Convert only the SH storage values, rejecting non-finite/overflow data."""
+    if source_dtype not in SH_DTYPES or target_dtype not in SH_DTYPES:
+        raise ValueError("SH dtype must be float16 or float32")
+    if len(data) % (48 * SH_DTYPES[source_dtype].itemsize):
+        raise ValueError("SH chunks must contain 48 coefficients per particle")
+    values = np.frombuffer(data, dtype=SH_DTYPES[source_dtype])
+    if not np.isfinite(values).all():
+        raise ValueError("SH coefficients must be finite")
+    if source_dtype == target_dtype:
+        return bytes(data)
+    if target_dtype == "float16" and np.any(np.abs(values) > np.finfo(np.float16).max):
+        raise ValueError("SH coefficients exceed the finite float16 range")
+    with np.errstate(over="ignore", invalid="ignore"):
+        converted = values.astype(SH_DTYPES[target_dtype])
+    if not np.isfinite(converted).all():
+        raise ValueError("SH conversion overflowed its finite target dtype")
+    return converted.tobytes()
+
+
+def set_sh_precision_metadata(manifest, target_dtype, source_spec=None):
+    """Record half rounding even if a later repack expands storage to float32."""
+    source_spec = source_spec or {}
+    output_spec = manifest["files"]["sh"]
+    output_spec["dtype"] = target_dtype
+    had_half_rounding = (target_dtype == "float16" or source_spec.get("dtype") == "float16"
+                         or source_spec.get("quantization_dtype") == "float16")
+    if had_half_rounding:
+        output_spec["quantization_dtype"] = "float16"
+        description = "float16 (quantized)" if target_dtype == "float16" else "float32 expanded from float16; earlier rounding is retained"
+        manifest["precision"] = f"geometry storage float32; SH storage {description}; BVH float32/u32; no additional pruning"
+
+
+def _shuffle_bytes(data, width, inverse=False):
+    if width not in (2, 4):
+        raise ValueError("Byte shuffle width must be 2 or 4")
+    if len(data) % width:
+        raise ValueError(f"byte-shuffle-{width} requires a byte length divisible by {width}")
+    array = np.frombuffer(data, dtype=np.uint8)
+    return (array.reshape(width, -1).T if inverse else array.reshape(-1, width).T).copy().tobytes()
+
+
+def shuffle_bytes2(data, inverse=False):
+    """Transpose the two byte lanes of packed IEEE binary16 values losslessly."""
+    return _shuffle_bytes(data, 2, inverse)
+
+
+def shuffle_bytes4(data, inverse=False):
+    """Transpose byte lanes without interpreting float/int values or rounding.
+
+    Four-byte words [a0 a1 a2 a3][b0 b1 b2 b3] become
+    [a0 b0][a1 b1][a2 b2][a3 b3]. Each file part is transformed independently.
+    This works equally for float32 geometry/SH and the mixed float/u32 BVH.
+    """
+    return _shuffle_bytes(data, 4, inverse)
+
+
+def encode_binary_part(data, compression="none", *, shuffle_bytes=4):
+    """Return encoded bytes and additive V1 manifest transport metadata."""
+    if compression not in COMPRESSION_MODES:
+        raise ValueError(f"Unsupported compression: {compression}")
+    if shuffle_bytes not in (2, 4):
+        raise ValueError("Byte shuffle width must be 2 or 4")
+    if not 0 < len(data) < MAX_PART_BYTES:
+        raise ValueError("Decoded parts must be nonempty and below 100 MiB")
+    raw = bytes(data)
+    metadata = {"byteLength": len(raw), "downloadByteLength": len(raw),
+                "compression": "none", "transform": "none",
+                "sha256": hashlib.sha256(raw).hexdigest()}
+    encoded = raw
+    if compression != "none":
+        transformed = _shuffle_bytes(raw, shuffle_bytes) if compression == "gzip-shuffle" else raw
+        candidate = gzip.compress(transformed, compresslevel=6, mtime=0)
+        if len(candidate) < len(raw):
+            encoded = candidate
+            metadata.update(compression="gzip", transform=f"byte-shuffle-{shuffle_bytes}" if compression == "gzip-shuffle" else "none",
+                            downloadByteLength=len(encoded))
+        else:
+            # Preserve the raw filename and actual encoding explicitly. A
+            # compressed chunk must not exceed the original/Git upload budget.
+            metadata["compressionFallback"] = "not-smaller"
+    return encoded, metadata
+
+
+def decode_binary_part(encoded, part):
+    """Read legacy raw or new compressed parts, with bounded decompression."""
+    expected = part.get("byteLength")
+    if type(expected) is not int or not 0 < expected < MAX_PART_BYTES:
+        raise ValueError("Part byteLength must be positive and below 100 MiB")
+    compression = part.get("compression", "none")
+    transform = part.get("transform", "none")
+    downloaded = part.get("downloadByteLength", expected)
+    if type(downloaded) is not int or downloaded != len(encoded) or not 0 < downloaded < MAX_PART_BYTES:
+        raise ValueError("Part downloadByteLength does not match the encoded file")
+    if compression == "none":
+        if transform != "none":
+            raise ValueError("Raw parts cannot declare a byte transform")
+        raw = bytes(encoded)
+    elif compression == "gzip":
+        if transform not in ("none", "byte-shuffle-2", "byte-shuffle-4"):
+            raise ValueError(f"Unsupported byte transform: {transform}")
+        decoder = zlib.decompressobj(16 + zlib.MAX_WBITS)
+        raw = decoder.decompress(encoded, expected + 1)
+        if len(raw) > expected or not decoder.eof or decoder.unused_data or decoder.unconsumed_tail:
+            raise ValueError("Invalid, oversized, truncated or multi-member gzip part")
+        if transform != "none":
+            raw = _shuffle_bytes(raw, 2 if transform == "byte-shuffle-2" else 4, inverse=True)
+    else:
+        raise ValueError(f"Unsupported compression: {compression}")
+    if len(raw) != expected:
+        raise ValueError("Decoded part does not match byteLength")
+    if "sha256" in part and part["sha256"] != hashlib.sha256(raw).hexdigest():
+        raise ValueError("Decoded part SHA256 does not match the manifest")
+    return raw
+
+
+def write_binary_part(directory, name, number, data, compression="none", *, shuffle_bytes=4):
+    if not name or Path(name).name != name or any(char in name for char in "\\/%?#"):
+        raise ValueError("Buffer name must be a simple filename component")
+    encoded, part = encode_binary_part(data, compression, shuffle_bytes=shuffle_bytes)
+    suffix = ".shuf.gz" if part["transform"] in ("byte-shuffle-2", "byte-shuffle-4") else ".gz" if part["compression"] == "gzip" else ""
+    path = f"{name}.{number:03d}.bin{suffix}"
+    (Path(directory) / path).write_bytes(encoded)
+    return {"path": path, **part}
+
+
+def write_parts(directory, name, array, stride, max_bytes, compression="none", *, shuffle_bytes=4):
+    """Write record-aligned parts; byteLength always means decoded GPU bytes."""
     if not stride <= max_bytes < 100 * 1024 * 1024:
         raise ValueError("Chunk budget must hold a record and remain below 100 MiB")
     records_per_part = max_bytes // stride
@@ -421,27 +557,31 @@ def write_parts(directory, name, array, stride, max_bytes):
     parts = []
     for number, start in enumerate(range(0, len(array), records_per_part)):
         end = min(start + records_per_part, len(array))
-        path = f"{name}.{number:03d}.bin"
-        with (Path(directory) / path).open("wb") as stream:
-            stream.write(memoryview(array[start:end]).cast("B"))
-        parts.append({"path": path, "byteLength": (end - start) * stride})
-    return {"byteLength": array.nbytes, "stride": stride, "parts": parts}
+        parts.append(write_binary_part(directory, name, number, memoryview(array[start:end]).cast("B"), compression, shuffle_bytes=shuffle_bytes))
+    return {"byteLength": array.nbytes, "downloadByteLength": sum(part["downloadByteLength"] for part in parts),
+            "stride": stride, "parts": parts}
 
 
 def export_checkpoint(checkpoint, output, *, source_name="checkpoint.pt", leaf_size=8,
                       bvh_method="sah", sah_bins=12,
                       chunk_bytes=64 * 1024 * 1024, camera_json=None, data_path=None,
-                      fov_y=math.radians(70), overwrite=False):
+                      fov_y=math.radians(70), overwrite=False, compression="none", sh_dtype="float32"):
     output = Path(output)
     if output.exists() and (not output.is_dir() or (any(output.iterdir()) and not overwrite)):
         raise FileExistsError(f"Output already exists: {output}; choose another directory or pass --overwrite")
     if not math.isfinite(fov_y) or not 0 < fov_y < math.pi:
         raise ValueError("Preview vertical FOV must be between 0 and pi")
+    if compression not in COMPRESSION_MODES:
+        raise ValueError(f"Unsupported compression: {compression}")
+    if sh_dtype not in SH_DTYPES:
+        raise ValueError("SH dtype must be float16 or float32")
     render = validate_config(checkpoint)
     geometry, sh, minimum, maximum = prepare_gaussians(checkpoint, render)
     cameras, camera_source = export_cameras(checkpoint, geometry[:, :3], camera_json, data_path, fov_y)
     nodes, order, depth = build_bvh(minimum, maximum, leaf_size, method=bvh_method, bins=sah_bins)
     geometry, sh = geometry[order], sh[order]
+    if sh_dtype == "float16":
+        sh = np.frombuffer(convert_sh_bytes(sh.tobytes(), "float32", sh_dtype), dtype=SH_DTYPES[sh_dtype]).reshape(-1, 48)
     manifest = {
         "schema": SCHEMA, "source": Path(source_name).name,
         "gaussian_count": len(geometry), "bvh_node_count": len(nodes), "bvh_max_depth": depth,
@@ -473,17 +613,19 @@ def export_checkpoint(checkpoint, output, *, source_name="checkpoint.pt", leaf_s
         for buffer in old.get("files", {}).values():
             for part in buffer.get("parts", []):
                 name = part.get("path", "")
-                if name and Path(name).name == name:
+                if name and Path(name).name == name and name not in ("alignment.json", "cameras.json", "manifest.json"):
                     old_parts.add(name)
     # Complete the export in a sibling staging directory before touching the
     # requested destination. Manifest is installed last to mark completion.
     with tempfile.TemporaryDirectory(prefix=".webgpu-export-", dir=output.parent) as temporary:
         stage = Path(temporary)
         manifest["files"] = {
-            "geometry": write_parts(stage, "geometry", geometry, 64, chunk_bytes),
-            "sh": write_parts(stage, "sh", sh, 192, chunk_bytes),
-            "bvh": write_parts(stage, "bvh", nodes, 32, chunk_bytes),
+            "geometry": write_parts(stage, "geometry", geometry, 64, chunk_bytes, compression),
+            "sh": write_parts(stage, "sh", sh, 48 * SH_DTYPES[sh_dtype].itemsize, chunk_bytes, compression,
+                              shuffle_bytes=SH_DTYPES[sh_dtype].itemsize),
+            "bvh": write_parts(stage, "bvh", nodes, 32, chunk_bytes, compression),
         }
+        set_sh_precision_metadata(manifest, sh_dtype)
         (stage / "manifest.json").write_text(json.dumps(manifest, indent=2, ensure_ascii=False, allow_nan=False) + "\n")
         output.mkdir(exist_ok=True)
         new_parts = {part["path"] for buffer in manifest["files"].values() for part in buffer["parts"]}
@@ -506,6 +648,10 @@ def main(argv=None):
     parser.add_argument("--bvh-method", choices=("sah", "median"), default="sah")
     parser.add_argument("--sah-bins", type=int, default=12)
     parser.add_argument("--chunk-mib", type=float, default=64)
+    parser.add_argument("--compression", choices=COMPRESSION_MODES, default="gzip-shuffle",
+                        help="Lossless transport encoding (default: gzip-shuffle), applied after any requested SH dtype conversion")
+    parser.add_argument("--sh-dtype", choices=tuple(SH_DTYPES), default="float32",
+                        help="SH storage dtype (default: float32); float16 explicitly quantizes SH only")
     parser.add_argument("--overwrite", action="store_true")
     args = parser.parse_args(argv)
     if not 0 < args.chunk_mib < 100:
@@ -517,10 +663,17 @@ def main(argv=None):
         bvh_method=args.bvh_method, sah_bins=args.sah_bins,
         camera_json=args.camera_json, data_path=args.data_path,
         fov_y=math.radians(args.fov_deg), overwrite=args.overwrite,
+        compression=args.compression, sh_dtype=args.sh_dtype,
     )
     summary = {key: manifest[key] for key in ("gaussian_count", "bvh_node_count", "bvh_max_depth")}
     summary["manifest"] = str(args.out_dir / "manifest.json")
     summary["total_binary_bytes"] = sum(item["byteLength"] for item in manifest["files"].values())
+    summary["total_download_bytes"] = sum(item["downloadByteLength"] for item in manifest["files"].values())
+    summary["decoded_bytes"] = summary["total_binary_bytes"]
+    summary["stored_bytes"] = summary["total_download_bytes"]
+    summary["compression_ratio"] = summary["decoded_bytes"] / summary["stored_bytes"]
+    summary["saved_percent"] = 100 * (1 - summary["stored_bytes"] / summary["decoded_bytes"])
+    summary["sh_dtype"] = manifest["files"]["sh"]["dtype"]
     summary["bvh_method"] = manifest["bvh_method"]
     summary["bvh_stats"] = manifest["bvh_stats"]
     print(json.dumps(summary, indent=2))

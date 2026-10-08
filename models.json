@@ -3,18 +3,13 @@
   "models": [
     {
       "id": "fc-room1",
-      "name": "fc-room1",
+      "name": "room1",
       "url": "models/fc-room1/manifest.json"
     },
     {
       "id": "fc-lounge",
-      "name": "fc-lounge",
+      "name": "lounge",
       "url": "models/fc-lounge/manifest.json"
-    },
-    {
-      "id": "fc-lounge-aligned",
-      "name": "fc-lounge-aligned",
-      "url": "models/fc-lounge-aligned/manifest.json"
     }
   ]
 }

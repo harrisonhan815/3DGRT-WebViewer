@@ -1,4 +1,5 @@
-// Browser-only FP32 port of the reference/instances quartic 3DGRT renderer.
+// Browser-only FP32 math for reference/instances quartic 3DGRT rendering.
+// SH coefficients may use FP32 or packed FP16 storage; geometry stays FP32.
 // See trace.wgsl for the upstream equation attribution and license.
 
 const PRESENT_SHADER = `
@@ -27,6 +28,30 @@ function bytesOf(value, label) {
     if (value instanceof ArrayBuffer) return new Uint8Array(value);
     if (ArrayBuffer.isView(value)) return new Uint8Array(value.buffer, value.byteOffset, value.byteLength);
     throw new Error(`${label} must be an ArrayBuffer or typed array.`);
+}
+
+export function shStorageFormat(metadata) {
+    if (!metadata || typeof metadata !== "object" || Array.isArray(metadata)) throw new Error("Expected model metadata.");
+    if (metadata.byte_order !== undefined && metadata.byte_order !== "little-endian") {
+        throw new Error("Model buffers must use little-endian byte order.");
+    }
+    // Small programmatic scenes predating manifest files remain valid FP32
+    // inputs. New FP16 files must declare their type explicitly.
+    const file = metadata.files?.sh;
+    if (metadata.files !== undefined && (!file || typeof file !== "object" || Array.isArray(file))) {
+        throw new Error("Model metadata is missing the SH file description.");
+    }
+    if (file?.byte_order !== undefined && file.byte_order !== "little-endian") {
+        throw new Error("SH coefficients must use little-endian byte order.");
+    }
+    const dtype = file?.dtype === undefined ? "float32" : file.dtype;
+    if (dtype !== "float32" && dtype !== "float16") throw new Error(`Unsupported SH storage type: ${String(dtype)}.`);
+    const packed = dtype === "float16";
+    const stride = packed ? 96 : 192;
+    if (file?.stride !== undefined && file.stride !== stride) {
+        throw new Error(`SH stride ${String(file.stride)} does not match ${dtype} (${stride} bytes per Gaussian).`);
+    }
+    return {dtype, stride, packed};
 }
 
 async function checkedShader(device, code, label) {
@@ -84,6 +109,7 @@ export class WebGpuRayRenderer {
         this.width = 0;
         this.height = 0;
         this.model = null;
+        this.shFormat = null;
         this.modelRevision = 0;
         this.previewTarget = null;
         this.camera = null;
@@ -168,8 +194,9 @@ export class WebGpuRayRenderer {
         }
         if (render.max_alpha !== undefined && render.max_alpha !== 0.99) throw new Error("The native maximum alpha must be 0.99.");
         const background = finiteVector(render.background, 3, "render.background");
+        const shFormat = shStorageFormat(metadata);
         const arrays = [bytesOf(geometry, "geometry"), bytesOf(sh, "sh"), bytesOf(bvh, "bvh")];
-        const sizes = [count * 64, count * 192, nodeCount * 32];
+        const sizes = [count * 64, count * shFormat.stride, nodeCount * 32];
         const labels = ["Gaussian geometry", "SH coefficients", "BVH"];
         const limit = Math.min(this.device.limits.maxStorageBufferBindingSize, this.device.limits.maxBufferSize);
         for (let i = 0; i < arrays.length; i++) {
@@ -215,6 +242,7 @@ export class WebGpuRayRenderer {
         this.modelBuffers = nextBuffers;
         this.projectedBuffer = nextProjected;
         this.model = {...metadata, render: {...render, background}};
+        this.shFormat = shFormat;
         this.modelRevision++;
         this.lastGpuMs = null;
         this.lastTileStats = null;
@@ -324,7 +352,7 @@ export class WebGpuRayRenderer {
             this.uniformFloats.set(camera.down, 8);
             this.uniformFloats.set(camera.forward, 12);
             this.uniformUints.set([width, height, render.sh_degree, this.model.bvh_node_count], 16);
-            this.uniformFloats.set([render.min_response, render.min_alpha, render.min_transmittance, 0], 20);
+            this.uniformFloats.set([render.min_response, render.min_alpha, render.min_transmittance, this.shFormat.packed ? 1 : 0], 20);
             this.uniformFloats.set(render.background, 24);
             // Each submission covers at most about 128K pixels. Submit/await
             // strips sequentially so navigation/disposal can stop between
@@ -481,7 +509,7 @@ export class WebGpuRayRenderer {
             floats.set(pose.down, 8);
             floats.set(pose.forward, 12);
             uints.set([width, height, settings.sh_degree, this.model.bvh_node_count], 16);
-            floats.set([settings.min_response, settings.min_alpha, settings.min_transmittance, 0], 20);
+            floats.set([settings.min_response, settings.min_alpha, settings.min_transmittance, this.shFormat.packed ? 1 : 0], 20);
             floats.set(settings.background, 24);
             const stripRows = Math.max(8, Math.floor(Math.min(height, 131072 / width) / 8) * 8);
             for (let row = 0; row < height; row += stripRows) {
@@ -628,6 +656,7 @@ export class WebGpuRayRenderer {
         this.context?.unconfigure();
         this.device.destroy();
         this.model = null;
+        this.shFormat = null;
         this.camera = null;
         this.computeBindGroup = null;
         this.presentBindGroup = null;

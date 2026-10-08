@@ -1,6 +1,6 @@
 # FullCircle WebGPU viewer
 
-Static browser renderer. Models are FP32 inference data with BVHs; no Python server is required.
+Static browser renderer with FP32 geometry/BVHs and optional packed FP16 SH colors. Rendering uses FP32 arithmetic; gzip model assets decode in background workers. No Python server is required.
 
 Publish this directory as a separate GitHub repository. In Settings > Pages, select Deploy from a branch, main, /(root). Open the resulting HTTPS URL in a WebGPU-capable browser.
 

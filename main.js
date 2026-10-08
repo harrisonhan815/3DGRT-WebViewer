@@ -1,7 +1,8 @@
-import { WebGpuRayRenderer } from './renderer.js';
+import { WebGpuRayRenderer, shStorageFormat } from './renderer.js';
 import { AdaptiveResolution } from './adaptive-resolution.js';
 import { createFrameAlignment, frameFromAlignment, defaultFrame, applyAlignment, alignmentUp, loadAlignment, ALIGNMENT_SCHEMA } from './alignment.js';
 import { AlignmentGizmo } from './alignment-gizmo.js';
+import { loadBuffer, validateFile } from './model-loader.js';
 
 const $ = (id) => document.getElementById(id);
 const canvas = $('view');
@@ -240,45 +241,19 @@ async function fetchJson(url, signal) {
   return res.json();
 }
 
-// Content-Length can be missing or compressed on CDNs: the manifest describes
-// decoded byte lengths, and the stream is checked before upload to WebGPU.
-async function loadBuffer(file, base, signal, onBytes) {
-  const result = new Uint8Array(file.byteLength);
-  let offset = 0;
-  for (const part of file.parts) {
-    const url = new URL(part.path, base);
-    const res = await fetch(url, { signal, credentials: 'omit' });
-    if (!res.ok) throw new Error(`${res.status}: ${url}`);
-    let received = 0;
-    const reader = res.body.getReader();
-    while (true) {
-      const { value, done } = await reader.read();
-      if (done) break;
-      if (received + value.byteLength > part.byteLength || offset + value.byteLength > result.length) {
-        await reader.cancel();
-        throw new Error(`模型分片大小与 manifest 不符：${part.path}`);
-      }
-      result.set(value, offset);
-      offset += value.byteLength;
-      received += value.byteLength;
-      onBytes(value.byteLength);
-    }
-    if (received !== part.byteLength) throw new Error(`模型分片不完整：${part.path}`);
-  }
-  if (offset !== result.length) throw new Error('模型缓冲区大小与 manifest 不符');
-  return result.buffer;
-}
-
 function validateManifest(m) {
   if (m.schema !== 'fullcircle-webgpu-reference-v1') throw new Error('不支持此模型格式，请使用配套 export_model.py 导出');
   if (!Array.isArray(m.cameras) || !m.cameras.length) throw new Error('模型缺少初始相机');
+  const shStorage = shStorageFormat(m);
   for (const key of ['geometry', 'sh', 'bvh']) {
     const f = m.files?.[key];
-    if (!f || !Number.isSafeInteger(f.byteLength) || f.byteLength <= 0 || !Array.isArray(f.parts)) throw new Error(`无效模型缓冲区：${key}`);
+    validateFile(f);
+    const count = key === 'bvh' ? m.bvh_node_count : m.gaussian_count;
+    const stride = {geometry:64,sh:shStorage.stride,bvh:32}[key];
+    if (!Number.isSafeInteger(count) || count < 1 || f.byteLength !== count*stride || (f.stride !== undefined && f.stride !== stride)) throw new Error(`模型数量、步长与缓冲区长度不一致：${key}`);
     if (f.byteLength > renderer.device.limits.maxStorageBufferBindingSize || f.byteLength > renderer.device.limits.maxBufferSize) {
       throw new Error(`模型的 ${key} 缓冲区超过当前浏览器显卡限制。需要支持更大 storage buffer 的设备。`);
     }
-    if (f.parts.some((p) => typeof p.path !== 'string' || !Number.isSafeInteger(p.byteLength) || p.byteLength <= 0) || f.parts.reduce((s, p) => s+p.byteLength, 0) !== f.byteLength) throw new Error(`无效模型分片：${key}`);
   }
 }
 
@@ -311,7 +286,8 @@ async function switchModel(entry) {
     const m = await fetchJson(base, loadController.signal);
     if (stopped) return;
     validateManifest(m);
-    const total = Object.values(m.files).reduce((s, f) => s + f.byteLength, 0);
+    const total = ['geometry','sh','bvh'].reduce((s,key) => s + validateFile(m.files[key]).downloadBytes,0);
+    const decodedTotal = ['geometry','sh','bvh'].reduce((s,key) => s + m.files[key].byteLength,0);
     let received = 0;
     $('progress').max = total;
     $('progress').value = 0;
@@ -319,7 +295,7 @@ async function switchModel(entry) {
       if (stopped) return;
       received += n;
       $('progress').value = received;
-      $('load-detail').textContent = `${(received / 1048576).toFixed(1)} / ${(total / 1048576).toFixed(1)} MiB`;
+      $('load-detail').textContent = `下载及解码 ${(received / 1048576).toFixed(1)} / ${(total / 1048576).toFixed(1)} MiB`;
     };
     const [geometry, sh, bvh, calibration] = await Promise.all([
       ...['geometry', 'sh', 'bvh'].map((key) => loadBuffer(m.files[key], base, loadController.signal, onBytes)),
@@ -341,7 +317,7 @@ async function switchModel(entry) {
     // This only affects the control speed, never the Gaussian parameters.
     const spans = m.bounds.max.map((v, i) => v-m.bounds.min[i]);
     baseSpeed = Math.max(0.05, Math.min(...spans.filter((v) => v > 0)) * 0.08);
-    $('details').textContent = `${m.gaussian_count.toLocaleString()} 个高斯 · SH ${m.render.sh_degree} · ${(total / 1048576).toFixed(1)} MiB`;
+    $('details').textContent = `${m.gaussian_count.toLocaleString()} 个高斯 · SH ${m.render.sh_degree}（${shStorageFormat(m).packed ? 'FP16' : 'FP32'}） · 下载 ${(total / 1048576).toFixed(1)} MiB${total !== decodedTotal ? ` / 解码后 ${(decodedTotal / 1048576).toFixed(1)} MiB` : ''}`;
     $('model').value = entry.id;
     const address = new URL(location.href);
     if (!address.searchParams.has('url')) {

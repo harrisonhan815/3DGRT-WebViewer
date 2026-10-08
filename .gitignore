@@ -1,1 +1,4 @@
 pt/
+__pycache__/
+*.py[cod]
+bak/
