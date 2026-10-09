@@ -26,12 +26,12 @@
     <div class="row">
       <label>静止渲染长边<select id="resolution">
         <option value="320">320 px</option><option value="480">480 px</option>
-        <option value="640" selected>640 px</option><option value="720">720 px</option>
-        <option value="960">960 px</option><option value="1280">1280 px</option><option value="1920">1920 px</option>
+        <option value="640">640 px</option><option value="720">720 px</option>
+        <option value="960" selected>960 px</option><option value="1280">1280 px</option><option value="1920">1920 px</option>
       </select></label>
-      <label>视场角<input id="fov" type="number" min="20" max="120" value="70" step="1"></label>
+      <label>垂直视场角<input id="fov" type="number" min="20" max="120" value="90" step="1"></label>
     </div>
-    <label class="check"><input id="adaptive" type="checkbox" checked>移动时自适应分辨率</label>
+    <label class="check"><input id="adaptive" type="checkbox">移动时自适应分辨率</label>
     <label class="check"><input id="fisheye-enabled" type="checkbox" checked>显示 180° 鱼眼对比</label>
     <label>交互帧率目标<select id="target-fps">
       <option value="30" selected>30 FPS</option><option value="60">60 FPS</option>

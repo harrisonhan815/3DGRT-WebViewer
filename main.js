@@ -5,6 +5,7 @@ import { AlignmentGizmo } from './alignment-gizmo.js';
 import { loadBuffer, validateFile } from './model-loader.js';
 
 const $ = (id) => document.getElementById(id);
+const DEFAULT_FOV_DEG = 90;
 const canvas = $('view');
 const previewCanvas = $('fisheye-view');
 let renderer, manifest, camera, worldUp, ready = false, loading = false, dirty = true, rendered = false;
@@ -22,7 +23,6 @@ let drag = null;
 const touchPointers = new Map();
 const adaptive = new AdaptiveResolution();
 if (matchMedia('(pointer: coarse)').matches && matchMedia('(max-width: 900px)').matches) {
-  $('resolution').value = '720';
   $('fisheye-enabled').checked = false;
   $('fisheye-panel').hidden = true;
   document.body.classList.add('collapsed');
@@ -232,14 +232,16 @@ function applyPreset(index) {
     right: [r[0][0], r[1][0], r[2][0]],
     down: [r[0][1], r[1][1], r[2][1]],
     forward: [r[0][2], r[1][2], r[2][2]],
-    tanHalfFovY: Math.tan(p.fov_y / 2),
+    // Viewer defaults are independent of the preset's exported image FOV.
+    // Presets retain their position/orientation and reset the viewer to 90°.
+    tanHalfFovY: Math.tan(DEFAULT_FOV_DEG * Math.PI / 360),
   };
   worldUp = camera.down.map((x) => -x);
   if (alignmentState?.enabled) {
     worldUp = alignmentUp(alignmentState);
     camera = applyAlignment(camera,alignmentState);
   }
-  $('fov').value = (p.fov_y * 180 / Math.PI).toFixed(1);
+  $('fov').value = DEFAULT_FOV_DEG;
   adaptive.reset();
   lastInteraction = -Infinity;
   markCameraChanged();
@@ -475,7 +477,7 @@ $('adaptive').addEventListener('change', () => { frameTimes = []; dirty = true; 
 $('target-fps').addEventListener('change', () => { adaptive.setTarget(Number($('target-fps').value)); dirty = true; });
 $('fov').addEventListener('change', () => {
   if (!ready) return;
-  const value = Math.min(120, Math.max(20, Number($('fov').value) || 70));
+  const value = Math.min(120, Math.max(20, Number($('fov').value) || DEFAULT_FOV_DEG));
   $('fov').value = value;
   camera.tanHalfFovY = Math.tan(value*Math.PI/360);
   adaptive.markMotion(performance.now());
@@ -620,7 +622,9 @@ async function frame(time) {
         lastMainCamera = frameCamera;
         mainRevision = frameRevision;
         updateGizmo();
-        adaptive.record(result, choice.moving);
+        // Renderer timing has no output-width field. Supply the chosen long
+        // edge so manual re-enabling also adapts correctly in portrait views.
+        adaptive.record({ width: choice.width, renderMs: result.renderMs }, choice.moving);
         canvas.dataset.quality = choice.moving ? 'moving' : 'full';
         canvas.style.visibility = 'visible';
         rendered = true;
