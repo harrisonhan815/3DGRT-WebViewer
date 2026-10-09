@@ -2,15 +2,15 @@
   "default": "fc-room1-multifov-pruned",
   "models": [
     {
-      "id": "fc-room1-pinhole-trial",
-      "name": "room1 · 针孔微调试验",
-      "url": "https://models.hhds-us01.xyz/models/fc-room1-pinhole-trial/manifest.json",
+      "id": "fc-room1-multifov-pruned",
+      "name": "room1",
+      "url": "https://models.hhds-us01.xyz/models/fc-room1-multifov-pruned/manifest.json",
       "output_projection": "pinhole"
     },
     {
-      "id": "fc-room1-multifov-pruned",
-      "name": "room1 · 多针孔FOV监督+后处理剪枝",
-      "url": "https://models.hhds-us01.xyz/models/fc-room1-multifov-pruned/manifest.json",
+      "id": "fc-lounge-multifov-pruned",
+      "name": "lounge",
+      "url": "https://models.hhds-us01.xyz/models/fc-lounge-multifov-pruned/manifest.json",
       "output_projection": "pinhole"
     }
   ]
