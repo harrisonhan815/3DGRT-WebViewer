@@ -1,5 +1,5 @@
 pt/
 __pycache__/
 bak/
-models
-legacy-webgpu/models
+models/
+legacy-webgpu/models/
