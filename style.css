@@ -49,6 +49,19 @@ progress { width: min(360px, 75vw); accent-color: #86bdff; }
 #error { position: fixed; bottom: 24px; left: 50%; transform: translateX(-50%); width: min(680px, 90vw); padding: 18px; border: 1px solid #be7474; border-radius: 8px; background: #351f24ee; color: #ffd9d9; white-space: pre-wrap; overflow-wrap: anywhere; font-size: 14px; }
 #loading, #error { z-index: 3; }
 #exit-panel { z-index: 4; }
+#flight-controls { display:none; position:fixed; inset:0; pointer-events:none; z-index:2; }
+.flight-stick { position:absolute; bottom:max(24px,env(safe-area-inset-bottom)); width:96px; height:96px; border-radius:50%; border:1px solid #bed7ec80; background:#15243555; touch-action:none; user-select:none; pointer-events:auto; }
+.flight-stick[data-stick=left] { left:max(22px,env(safe-area-inset-left)); }
+.flight-stick[data-stick=right] { right:max(22px,env(safe-area-inset-right)); }
+.stick-knob { position:absolute; width:30px; height:30px; left:32px; top:32px; border-radius:50%; background:#aecce599; border:1px solid #e2f2ffb3; pointer-events:none; }
+.flight-stick.active { border-color:#bce0ff; background:#27435d70; }
+.flight-stick.active .stick-knob { background:#9cd2fff0; }
+.stick-label { position:absolute; top:100%; left:0; width:100%; text-align:center; padding-top:3px; font-size:10px; color:#d4e5f3; text-shadow:0 1px 3px #000; pointer-events:none; }
+@media (pointer:coarse) and (orientation:landscape) and (max-height:600px) {
+  body.collapsed #flight-controls { display:block; }
+  #fisheye-panel { bottom:148px; width:140px; padding:6px; }
+  #fisheye-status { font-size:9px; }
+}
 @media (max-width: 580px) { aside { width: 250px; } #toggle { left: 282px; } }
 @media (pointer: coarse) and (max-width: 900px) {
   #panel { max-height: calc(100dvh - 32px); }

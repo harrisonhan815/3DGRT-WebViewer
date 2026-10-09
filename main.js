@@ -3,6 +3,7 @@ import { AdaptiveResolution } from './adaptive-resolution.js';
 import { createFrameAlignment, frameFromAlignment, defaultFrame, applyAlignment, alignmentUp, loadAlignment, ALIGNMENT_SCHEMA } from './alignment.js';
 import { AlignmentGizmo } from './alignment-gizmo.js';
 import { loadBuffer, validateFile } from './model-loader.js';
+import { FlightControls } from './flight-controls.js';
 
 const $ = (id) => document.getElementById(id);
 const DEFAULT_FOV_DEG = 90;
@@ -11,6 +12,7 @@ const previewCanvas = $('fisheye-view');
 let renderer, manifest, camera, worldUp, ready = false, loading = false, dirty = true, rendered = false;
 let catalog = [], currentId = '', loadController, busy = false, capturing = false, baseSpeed = 1;
 let activeProjection = 'fisheye-perspective';
+let flightControls = null;
 let frameTimes = [], previousFrame = 0, lastUiUpdate = 0;
 let stopped = false, animationFrame = null;
 let rendererInitialization = null, exitPromise = null;
@@ -22,7 +24,7 @@ const keys = new Set();
 let drag = null;
 const touchPointers = new Map();
 const adaptive = new AdaptiveResolution();
-if (matchMedia('(pointer: coarse)').matches && matchMedia('(max-width: 900px)').matches) {
+if (matchMedia('(pointer: coarse)').matches && matchMedia('(max-width: 900px), (max-height: 600px)').matches) {
   $('fisheye-enabled').checked = false;
   $('fisheye-panel').hidden = true;
   document.body.classList.add('collapsed');
@@ -52,6 +54,7 @@ function haltViewer() {
   ready = false;
   keys.clear();
   clearPointerState();
+  flightControls?.dispose();
   if (animationFrame !== null) cancelAnimationFrame(animationFrame);
   animationFrame = null;
   loadController?.abort();
@@ -389,7 +392,10 @@ function move(direction, distance) {
 function turn(dx, dy) {
   if (dx === 0 && dy === 0) return;
   // Match the existing pan interaction: dragging right moves the scene right.
-  const yaw = dx * 0.003, pitch = dy * 0.003;
+  rotateCamera(dx * 0.003, dy * 0.003);
+}
+function rotateCamera(yaw, pitch) {
+  if (yaw === 0 && pitch === 0) return;
   for (const key of ['right', 'down', 'forward']) camera[key] = rotate(camera[key], worldUp, yaw);
   const right = [...camera.right];
   for (const key of ['down', 'forward']) camera[key] = rotate(camera[key], right, pitch);
@@ -401,6 +407,7 @@ function turn(dx, dy) {
 }
 
 function clearPointerState() {
+  flightControls?.reset();
   const ids = [...touchPointers.keys(), ...(drag ? [drag.id] : [])];
   touchPointers.clear();
   drag = null;
@@ -567,7 +574,7 @@ $('align-save').addEventListener('click', async () => {
     if (!stopped) updateAlignmentControls();
   }
 });
-$('toggle').addEventListener('click', () => document.body.classList.toggle('collapsed'));
+$('toggle').addEventListener('click', () => { clearPointerState(); document.body.classList.toggle('collapsed'); });
 $('continuous').addEventListener('change', () => { frameTimes = []; dirty = true; });
 $('save').addEventListener('click', async () => {
   if (!ready || !rendered || loading || capturing) return;
@@ -603,6 +610,18 @@ async function frame(time) {
     if (keys.has('KeyA')) move(camera.right, -speed);
     if (keys.has('KeyE')) move(worldUp, speed);
     if (keys.has('KeyQ')) move(worldUp, -speed);
+    const sticks = flightControls.sample();
+    if (sticks.yaw) rotateCamera(-sticks.yaw * 1.2 * dt, 0);
+    if (sticks.altitude) move(worldUp, sticks.altitude * speed);
+    if (sticks.forward || sticks.strafe) {
+      const up = norm(worldUp);
+      let forward = camera.forward.map((v,i)=>v-dot(camera.forward,up)*up[i]);
+      if (length(forward)<1e-6) forward=cross(up,camera.right);
+      forward=norm(forward);
+      const right=norm(cross(forward,up));
+      // Like flight controls, translation is level even while looking up/down.
+      move(forward,sticks.forward*speed); move(right,sticks.strafe*speed);
+    }
     const choice = adaptive.select(Number($('resolution').value), performance.now(), $('adaptive').checked);
     const aspect = canvas.clientWidth / Math.max(1, canvas.clientHeight);
     const width = aspect >= 1 ? choice.width : Math.max(1, Math.round(choice.width * aspect));
@@ -710,6 +729,8 @@ async function main() {
   scheduleFrame();
   await switchModel(entry);
 }
+flightControls = new FlightControls($('flight-controls'), () =>
+  ready && !loading && !stopped && !capturing && !calibrationDragging && document.body.classList.contains('collapsed'));
 main().catch((error) => {
   if (stopped) return;
   $('loading').hidden = true;
