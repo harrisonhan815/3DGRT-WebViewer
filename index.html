@@ -42,14 +42,13 @@
     <p id="details">等待载入模型</p>
     <p id="stats" title="FPS 为连续完成帧率；GPU 为可用时的绘制采样；不支持计时时只显示完成帧耗时。">—</p>
     <p id="quality" class="muted"></p>
-    <p class="help">左键拖动转向 · 右键拖动平移 · 滚轮前后<br>WASD 移动 · Q/E 上下 · Shift 加速<br>触屏：单指转向 · 双指平移 · 捏合前后<br>横屏摇杆：左杆升降/转向，右杆前后/左右</p>
+    <p class="help">左键拖动转向 · 右键拖动平移 · 滚轮前后<br>WASD 移动 · Q/E 上下 · Shift 加速<br>触屏：单指转向 · 双指上滑升高、下滑降低<br>右摇杆：沿校准地平面前后、左右移动</p>
     <p id="adapter" class="muted"></p>
   </aside>
   <button id="toggle" aria-label="展开或收起控制栏">☰</button>
   <button id="safe-exit" type="button" title="停止渲染并清理资源后关闭页面">安全退出</button>
-  <div id="flight-controls" aria-label="美国手双摇杆">
-    <div class="flight-stick" data-stick="left" aria-label="左杆：上下升降，左右转向"><span class="stick-knob"></span><span class="stick-label">升降 · 转向</span></div>
-    <div class="flight-stick" data-stick="right" aria-label="右杆：前后移动，左右平移"><span class="stick-knob"></span><span class="stick-label">前后 · 左右</span></div>
+  <div id="flight-controls" aria-label="水平移动摇杆">
+    <div class="flight-stick" data-stick="right" aria-label="右摇杆：沿校准地平面前后、左右移动，保持高度"><span class="stick-knob"></span><span class="stick-label">水平移动</span></div>
   </div>
   <section id="fisheye-panel" aria-label="当前视角的鱼眼投影对比">
     <div class="fisheye-heading"><strong>180° 鱼眼对比</strong><button id="fisheye-hide" type="button" aria-label="关闭鱼眼对比">×</button></div>

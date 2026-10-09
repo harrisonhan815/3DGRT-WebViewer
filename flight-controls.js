@@ -1,13 +1,13 @@
-// Mode-2 touch sticks: left altitude/yaw, right level forward/strafe.
+// A translation-only right stick, available in either touch-screen orientation.
 export class FlightControls {
   constructor(element, canControl) {
     this.element = element;
     this.canControl = canControl;
-    this.media = matchMedia('(pointer: coarse) and (orientation: landscape) and (max-height: 600px)');
+    this.media = matchMedia('(pointer: coarse)');
     this.controller = new AbortController();
     const options = {signal:this.controller.signal};
     this.sticks = {};
-    for (const side of ['left','right']) {
+    for (const side of ['right']) {
       const zone = element.querySelector(`[data-stick="${side}"]`);
       const state = this.sticks[side] = {zone,knob:zone.querySelector('.stick-knob'),id:null,x:0,y:0};
       const update = e => {
@@ -57,8 +57,8 @@ export class FlightControls {
   reset() { for (const state of Object.values(this.sticks)) this.release(state); }
   sample() {
     if (!this.available()) this.reset();
-    const {left,right}=this.sticks;
-    return {yaw:left.x,altitude:left.y,strafe:right.x,forward:right.y};
+    const {right}=this.sticks;
+    return {strafe:right.x,forward:right.y};
   }
   dispose() { this.reset(); this.controller.abort(); }
 }

@@ -417,7 +417,7 @@ function clearPointerState() {
 }
 function touchPair() {
   const [a, b] = touchPointers.values();
-  return { x: (a.x+b.x)/2, y: (a.y+b.y)/2, span: Math.hypot(a.x-b.x,a.y-b.y) };
+  return { y: (a.y+b.y)/2 };
 }
 function pan(dx, dy) {
   const scale = baseSpeed * Math.pow(10, Number($('speed').value)) * 0.006;
@@ -448,9 +448,10 @@ canvas.addEventListener('pointermove', (e) => {
     touchPointers.set(e.pointerId, {x:e.clientX,y:e.clientY});
     if (pair) {
       const next = touchPair();
-      pan(next.x-pair.x, next.y-pair.y);
       const scale = baseSpeed * Math.pow(10, Number($('speed').value)) * 0.006;
-      move(camera.forward, (next.span-pair.span)*scale);
+      // Only the pair's vertical midpoint changes calibrated height;
+      // horizontal movement and pinch distance are ignored.
+      move(norm(worldUp), (pair.y-next.y)*scale);
     } else turn(e.clientX-previous.x, e.clientY-previous.y);
     return;
   }
@@ -478,7 +479,7 @@ window.addEventListener('keydown', (e) => {
 window.addEventListener('keyup', (e) => keys.delete(e.code));
 window.addEventListener('blur', () => { keys.clear(); clearPointerState(); });
 document.addEventListener('visibilitychange', () => { keys.clear(); clearPointerState(); frameTimes = []; dirty = true; });
-window.addEventListener('resize', () => { adaptive.markMotion(performance.now()); markCameraChanged(true); updateGizmo(); });
+window.addEventListener('resize', () => { clearPointerState(); adaptive.markMotion(performance.now()); markCameraChanged(true); updateGizmo(); });
 $('resolution').addEventListener('change', () => { frameTimes = []; dirty = true; });
 $('adaptive').addEventListener('change', () => { frameTimes = []; dirty = true; });
 $('target-fps').addEventListener('change', () => { adaptive.setTarget(Number($('target-fps').value)); dirty = true; });
@@ -611,15 +612,15 @@ async function frame(time) {
     if (keys.has('KeyE')) move(worldUp, speed);
     if (keys.has('KeyQ')) move(worldUp, -speed);
     const sticks = flightControls.sample();
-    if (sticks.yaw) rotateCamera(-sticks.yaw * 1.2 * dt, 0);
-    if (sticks.altitude) move(worldUp, sticks.altitude * speed);
     if (sticks.forward || sticks.strafe) {
       const up = norm(worldUp);
-      let forward = camera.forward.map((v,i)=>v-dot(camera.forward,up)*up[i]);
+      const vertical = dot(camera.forward,up);
+      let forward = camera.forward.map((v,i)=>v-vertical*up[i]);
       if (length(forward)<1e-6) forward=cross(up,camera.right);
       forward=norm(forward);
       const right=norm(cross(forward,up));
-      // Like flight controls, translation is level even while looking up/down.
+      // Use the saved ground-plane normal, not a hard-coded world axis.
+      // This is the forward view direction projected onto that plane.
       move(forward,sticks.forward*speed); move(right,sticks.strafe*speed);
     }
     const choice = adaptive.select(Number($('resolution').value), performance.now(), $('adaptive').checked);
@@ -730,7 +731,7 @@ async function main() {
   await switchModel(entry);
 }
 flightControls = new FlightControls($('flight-controls'), () =>
-  ready && !loading && !stopped && !capturing && !calibrationDragging && document.body.classList.contains('collapsed'));
+  ready && !loading && !stopped && !capturing && !calibrationDragging);
 main().catch((error) => {
   if (stopped) return;
   $('loading').hidden = true;
