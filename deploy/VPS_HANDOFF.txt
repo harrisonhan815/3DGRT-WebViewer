@@ -1,0 +1,61 @@
+3DGRT Viewer 模型下载源站交接
+
+目标与当前状态
+- 当前开发主机不是 VPS；不要在开发主机执行下面的服务器安装/服务命令。
+- 目标 VPS：Bandwagon，Ubuntu 24，洛杉矶。公网 IP、SSH 用户/端口待填写。
+- 域名：hhds-us01.xyz；模型入口计划为 models.hhds-us01.xyz。
+- 80/443 可能空闲，需实查。DNS、证书、ICP备案状态尚未确认。
+- 未连接或部署远端；只准备了 nginx-models.conf，并在隔离 nginx 1.24 上验证 HTTP 行为。
+- 本轮先建立 HTTPS 模型源站并测速；网页继续放 GitHub Pages，不运行训练/CUDA。
+
+一起携带
+- 本文及同目录 nginx-models.conf。
+- 开发主机上的 3DGRT-WebViewer/models/fc-room1-webgl2/ 和 fc-room1-pinhole-trial/。
+- 每个模型目录包含 manifest.json、geometry/sh 压缩分片、alignment.json；不需要 .pt。
+
+1. DNS 控制台
+新增 models 的 A 记录，指向 VPS 公网 IPv4。确认解析生效；80/443 须可从公网访问。
+
+2. 在 VPS 执行：先检查端口，确认没有冲突再安装
+sudo ss -ltnp '( sport = :80 or sport = :443 )'
+sudo apt update
+sudo apt install nginx certbot python3-certbot-nginx rsync
+sudo install -d -m 755 /var/www/3dgrt-assets/models
+sudo chown "$(id -un):$(id -gn)" /var/www/3dgrt-assets/models
+
+若 UFW 已启用，允许 TCP 80/443；若面板另设防火墙也需放行。保持现有 SSH 配置。
+
+3. 在开发主机执行：替换 VPS_USER、VPS_IP 后上传
+cd /home/harrison/droneGS/fullcircle/3DGRT-WebViewer
+rsync -av --chmod=D755,F644 models/fc-room1-webgl2 models/fc-room1-pinhole-trial VPS_USER@VPS_IP:/var/www/3dgrt-assets/models/
+scp deploy/nginx-models.conf deploy/VPS_HANDOFF.txt VPS_USER@VPS_IP:/tmp/
+
+非默认 SSH 端口：scp 加 -P 端口；rsync 加 -e 'ssh -p 端口'。
+模型传到远端后应位于 /var/www/3dgrt-assets/models/fc-room1-*/manifest.json。
+
+4. 在 VPS 执行：首次启用站点、签发 HTTPS 证书
+若已有同名站点/证书，先检查现有内容，不用 HTTP 模板覆盖；保留其他站点。
+sudo install -m 644 /tmp/nginx-models.conf /etc/nginx/sites-available/3dgrt-models
+sudo ln -s /etc/nginx/sites-available/3dgrt-models /etc/nginx/sites-enabled/3dgrt-models
+sudo nginx -t && sudo systemctl reload nginx
+sudo certbot --nginx -d models.hhds-us01.xyz --redirect
+sudo certbot renew --dry-run
+
+nginx 检查失败时先修复；Certbot 按提示填写邮箱并申请证书。
+
+5. 验收与网页接入
+curl -I https://models.hhds-us01.xyz/models/fc-room1-pinhole-trial/manifest.json
+curl -I https://models.hhds-us01.xyz/models/fc-room1-pinhole-trial/sh.000.bin.shuf.gz
+
+预期：200；Access-Control-Allow-Origin: *；JSON 为 no-store；分片为长期缓存。
+压缩分片无 Content-Encoding: gzip；域名根路径返回 404 是预期行为。
+验证成功后，在开发主机修改并发布 models.json，仅替换两个 url 为：
+https://models.hhds-us01.xyz/models/fc-room1-webgl2/manifest.json
+https://models.hhds-us01.xyz/models/fc-room1-pinhole-trial/manifest.json
+保留原 id/default，试验模型保留 output_projection: pinhole。
+
+后续
+分别从大陆、海外完整下载分片测速，再决定是否接 CDN。当前仅搭源站。
+若未备案，接 CDN 时不选择中国内地节点；CDN 的 HTTPS/回源/CNAME 是后续独立步骤。
+校正在网页下载为 alignment.json 后，需手动上传回对应模型目录。
+完成后记录实际 IP、SSH 端口、DNS 状态、HTTPS 验收及测速结果；不在文档记录密码/私钥。

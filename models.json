@@ -1,10 +1,11 @@
 {
-  "default": "fc-room1",
+  "default": "fc-room1-pinhole-trial",
   "models": [
     {
-      "id": "fc-room1",
-      "name": "room1",
-      "url": "models/fc-room1-webgl2/manifest.json"
+      "id": "fc-room1-pinhole-trial",
+      "name": "room1 · 针孔微调试验",
+      "url": "https://models.hhds-us01.xyz/models/fc-room1-pinhole-trial/manifest.json",
+      "output_projection": "pinhole"
     }
   ]
 }

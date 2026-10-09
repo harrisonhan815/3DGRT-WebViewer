@@ -9,6 +9,7 @@ const canvas = $('view');
 const previewCanvas = $('fisheye-view');
 let renderer, manifest, camera, worldUp, ready = false, loading = false, dirty = true, rendered = false;
 let catalog = [], currentId = '', loadController, busy = false, capturing = false, baseSpeed = 1;
+let activeProjection = 'fisheye-perspective';
 let frameTimes = [], previousFrame = 0, lastUiUpdate = 0;
 let stopped = false, animationFrame = null;
 let rendererInitialization = null, exitPromise = null;
@@ -278,6 +279,14 @@ function validateManifest(m) {
   renderer.validateModel(m);
 }
 
+function modelProjection(entry) {
+  const projection = entry.output_projection === undefined ? 'fisheye-perspective' : entry.output_projection;
+  if (!['pinhole', 'fisheye-perspective'].includes(projection)) {
+    throw new Error(`模型 ${entry.id} 的 output_projection 无效：${String(projection)}；只能使用 pinhole 或 fisheye-perspective。`);
+  }
+  return projection;
+}
+
 async function switchModel(entry) {
   clearPointerState();
   if (loading || stopped) return;
@@ -302,6 +311,7 @@ async function switchModel(entry) {
   loadController?.abort();
   loadController = new AbortController();
   try {
+    const projection = modelProjection(entry);
     // A previous frame may still be on the GPU when a dropdown is changed.
     while ((busy || capturing) && !stopped) await new Promise((resolve) => setTimeout(resolve, 10));
     if (stopped) return;
@@ -328,6 +338,7 @@ async function switchModel(entry) {
     $('load-detail').textContent = '上传到本机显卡';
     await renderer.loadModel({ geometry, sh, metadata: m });
     if (stopped) return;
+    activeProjection = projection;
     manifest = m;
     currentId = entry.id;
     modelManifestUrl = base;
@@ -602,8 +613,9 @@ async function frame(time) {
       try {
         const frameCamera = copyCamera(camera);
         const frameRevision = cameraRevision;
+        const frameProjection = activeProjection;
         renderer.setCamera(frameCamera);
-        const result = await renderer.render({ width, height });
+        const result = await renderer.render({ width, height, projection: frameProjection });
         if (stopped) return;
         lastMainCamera = frameCamera;
         mainRevision = frameRevision;
@@ -618,7 +630,7 @@ async function frame(time) {
         const fps = frameTimes.length > 1 ? (frameTimes.length-1)*1000/(done-frameTimes[0]) : null;
         if (done-lastUiUpdate > 200 || !$('continuous').checked) {
           $('stats').textContent = `${width} × ${height} · ${result.renderMs.toFixed(1)} ms / 完成帧${Number.isFinite(result.gpuMs) ? ` · GPU ≈ ${result.gpuMs.toFixed(1)} ms` : ''}${fps !== null ? ` · ${fps.toFixed(1)} FPS` : ''}`;
-          $('quality').textContent = `${choice.moving ? '交互分辨率' : '完整分辨率'} · WebGL2 Gaussian Splatting${result.accumulation === 'unorm8' ? ' · 兼容色彩精度' : ''}`;
+          $('quality').textContent = `${choice.moving ? '交互分辨率' : '完整分辨率'} · WebGL2 Gaussian Splatting · ${frameProjection === 'pinhole' ? '直接针孔' : '鱼眼透视显示'}${result.accumulation === 'unorm8' ? ' · 兼容色彩精度' : ''}`;
           lastUiUpdate = done;
         }
       } catch (error) { ready = false; message(error); }
