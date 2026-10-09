@@ -1,4 +1,4 @@
-import { WebGlSplatRenderer } from './renderer.js';
+import { WebGpuRayRenderer, shStorageFormat } from './renderer.js';
 import { AdaptiveResolution } from './adaptive-resolution.js';
 import { createFrameAlignment, frameFromAlignment, defaultFrame, applyAlignment, alignmentUp, loadAlignment, ALIGNMENT_SCHEMA } from './alignment.js';
 import { AlignmentGizmo } from './alignment-gizmo.js';
@@ -17,15 +17,7 @@ let lastMainCamera = null, lastInteraction = -Infinity;
 let alignmentState = null, modelManifestUrl = null, alignmentSaving = false, alignmentSaveController = null;
 let gizmoFrame = null, calibrationDragging = false;
 const keys = new Set();
-let drag = null;
-const touchPointers = new Map();
 const adaptive = new AdaptiveResolution();
-if (matchMedia('(pointer: coarse)').matches && matchMedia('(max-width: 900px)').matches) {
-  $('resolution').value = '720';
-  $('fisheye-enabled').checked = false;
-  $('fisheye-panel').hidden = true;
-  document.body.classList.add('collapsed');
-}
 const gizmo = new AlignmentGizmo($('alignment-overlay'), {
   onChange: (frame,event) => {
     if (stopped || !ready || loading || alignmentSaving) return;
@@ -40,7 +32,7 @@ const gizmo = new AlignmentGizmo($('alignment-overlay'), {
   },
   onDragState: (active) => {
     calibrationDragging = active;
-    if (active) { keys.clear(); clearPointerState(); }
+    if (active) { keys.clear(); drag = null; }
     if (!stopped) updateAlignmentControls();
   },
 });
@@ -50,7 +42,6 @@ function haltViewer() {
   stopped = true;
   ready = false;
   keys.clear();
-  clearPointerState();
   if (animationFrame !== null) cancelAnimationFrame(animationFrame);
   animationFrame = null;
   loadController?.abort();
@@ -84,8 +75,8 @@ async function safeExit() {
   exitPromise = (async () => {
     let initializationTimer;
     try {
-      // The button is also available while the graphics context is initializing.
-      // main() disposes a late-created context when it sees stopped=true.
+      // The button is also available while the first device is initializing.
+      // main() disposes a late-created device when it sees stopped=true.
       const activeRenderer = renderer ?? await Promise.race([
         rendererInitialization?.catch(() => null) ?? Promise.resolve(null),
         new Promise((_, reject) => {
@@ -136,7 +127,7 @@ async function safeExit() {
 $('safe-exit').addEventListener('click', safeExit);
 
 // pagehide covers navigation and back/forward-cache entry without adding an
-// unload listener. Restoring a cached page must create a new graphics context.
+// unload listener. Restoring a cached page must create a new WebGPU device.
 window.addEventListener('pagehide', stopViewer);
 window.addEventListener('pageshow', (event) => {
   if (event.persisted && stopped) location.reload();
@@ -223,7 +214,6 @@ function commitGizmoFrame(enabled = true) {
   }
 }
 function applyPreset(index) {
-  clearPointerState();
   const p = manifest.cameras[index];
   const r = p.rotation;
   camera = {
@@ -251,40 +241,27 @@ async function fetchJson(url, signal) {
   return res.json();
 }
 
-function shStorageFormat(m) {
-  const dtype = m.files?.sh?.dtype ?? 'float32';
-  if (!['float16', 'float32'].includes(dtype)) throw new Error('不支持此 SH 存储格式');
-  return { dtype, stride: dtype === 'float16' ? 96 : 192, packed: dtype === 'float16' };
-}
-
 function validateManifest(m) {
-  if (m.schema !== 'fullcircle-webgl2-ewa-v1') {
-    throw new Error(m.schema === 'fullcircle-webgpu-reference-v1'
-      ? '这是旧版 3DGRT 光追模型，不能由此 WebGL2 页面正确显示。请选择使用 WebGL2 导出工具生成的 3DGS 模型。'
-      : '不支持此模型格式，请使用当前 WebGL2 导出工具生成模型。');
-  }
+  if (m.schema !== 'fullcircle-webgpu-reference-v1') throw new Error('不支持此模型格式，请使用配套 export_model.py 导出');
   if (!Array.isArray(m.cameras) || !m.cameras.length) throw new Error('模型缺少初始相机');
-  const storage = shStorageFormat(m);
-  for (const key of ['geometry', 'sh']) {
-    const file = m.files?.[key];
-    validateFile(file);
-    const stride = key === 'geometry' ? 48 : storage.stride;
-    if (!Number.isSafeInteger(m.gaussian_count) || m.gaussian_count < 1
-        || file.byteLength !== m.gaussian_count * stride
-        || (file.stride !== undefined && file.stride !== stride)) {
-      throw new Error(`模型数量、步长与缓冲区长度不一致：${key}`);
+  const shStorage = shStorageFormat(m);
+  for (const key of ['geometry', 'sh', 'bvh']) {
+    const f = m.files?.[key];
+    validateFile(f);
+    const count = key === 'bvh' ? m.bvh_node_count : m.gaussian_count;
+    const stride = {geometry:64,sh:shStorage.stride,bvh:32}[key];
+    if (!Number.isSafeInteger(count) || count < 1 || f.byteLength !== count*stride || (f.stride !== undefined && f.stride !== stride)) throw new Error(`模型数量、步长与缓冲区长度不一致：${key}`);
+    if (f.byteLength > renderer.device.limits.maxStorageBufferBindingSize || f.byteLength > renderer.device.limits.maxBufferSize) {
+      throw new Error(`模型的 ${key} 缓冲区超过当前浏览器显卡限制。需要支持更大 storage buffer 的设备。`);
     }
   }
-  renderer.validateModel(m);
 }
 
 async function switchModel(entry) {
-  clearPointerState();
   if (loading || stopped) return;
   loading = true;
   ready = false;
   rendered = false;
-  canvas.style.visibility = 'hidden';
   alignmentSaveController?.abort();
   alignmentState = null;
   gizmoFrame = null;
@@ -309,8 +286,8 @@ async function switchModel(entry) {
     const m = await fetchJson(base, loadController.signal);
     if (stopped) return;
     validateManifest(m);
-    const total = ['geometry','sh'].reduce((s,key) => s + validateFile(m.files[key]).downloadBytes,0);
-    const decodedTotal = ['geometry','sh'].reduce((s,key) => s + m.files[key].byteLength,0);
+    const total = ['geometry','sh','bvh'].reduce((s,key) => s + validateFile(m.files[key]).downloadBytes,0);
+    const decodedTotal = ['geometry','sh','bvh'].reduce((s,key) => s + m.files[key].byteLength,0);
     let received = 0;
     $('progress').max = total;
     $('progress').value = 0;
@@ -320,13 +297,13 @@ async function switchModel(entry) {
       $('progress').value = received;
       $('load-detail').textContent = `下载及解码 ${(received / 1048576).toFixed(1)} / ${(total / 1048576).toFixed(1)} MiB`;
     };
-    const [geometry, sh, calibration] = await Promise.all([
-      ...['geometry', 'sh'].map((key) => loadBuffer(m.files[key], base, loadController.signal, onBytes)),
+    const [geometry, sh, bvh, calibration] = await Promise.all([
+      ...['geometry', 'sh', 'bvh'].map((key) => loadBuffer(m.files[key], base, loadController.signal, onBytes)),
       loadAlignment(base,m,loadController.signal),
     ]);
     if (stopped) return;
     $('load-detail').textContent = '上传到本机显卡';
-    await renderer.loadModel({ geometry, sh, metadata: m });
+    await renderer.loadModel({ geometry, sh, bvh, metadata: m });
     if (stopped) return;
     manifest = m;
     currentId = entry.id;
@@ -338,9 +315,8 @@ async function switchModel(entry) {
     $('camera').value = String(m.default_camera || 0);
     applyPreset(Number($('camera').value));
     // This only affects the control speed, never the Gaussian parameters.
-    const navigationBounds = m.navigation_bounds ?? m.bounds;
-    const spans = navigationBounds.max.map((v, i) => v-navigationBounds.min[i]).filter(v => Number.isFinite(v) && v > 0);
-    baseSpeed = spans.length ? Math.max(0.05, Math.min(...spans) * 0.08) : 0.05;
+    const spans = m.bounds.max.map((v, i) => v-m.bounds.min[i]);
+    baseSpeed = Math.max(0.05, Math.min(...spans.filter((v) => v > 0)) * 0.08);
     $('details').textContent = `${m.gaussian_count.toLocaleString()} 个高斯 · SH ${m.render.sh_degree}（${shStorageFormat(m).packed ? 'FP16' : 'FP32'}） · 下载 ${(total / 1048576).toFixed(1)} MiB${total !== decodedTotal ? ` / 解码后 ${(decodedTotal / 1048576).toFixed(1)} MiB` : ''}`;
     $('model').value = entry.id;
     const address = new URL(location.href);
@@ -387,66 +363,24 @@ function turn(dx, dy) {
   markCameraChanged(true);
 }
 
-function clearPointerState() {
-  const ids = [...touchPointers.keys(), ...(drag ? [drag.id] : [])];
-  touchPointers.clear();
-  drag = null;
-  for (const id of ids) {
-    if (canvas.hasPointerCapture(id)) canvas.releasePointerCapture(id);
-  }
-}
-function touchPair() {
-  const [a, b] = touchPointers.values();
-  return { x: (a.x+b.x)/2, y: (a.y+b.y)/2, span: Math.hypot(a.x-b.x,a.y-b.y) };
-}
-function pan(dx, dy) {
-  const scale = baseSpeed * Math.pow(10, Number($('speed').value)) * 0.006;
-  move(camera.right, -dx*scale); move(camera.down, -dy*scale);
-}
+let drag;
 canvas.addEventListener('contextmenu', (e) => e.preventDefault());
 canvas.addEventListener('pointerdown', (e) => {
-  if (!ready || loading || stopped || calibrationDragging) return;
-  if (e.pointerType === 'touch') {
-    if (drag || touchPointers.size >= 2) return;
-    canvas.focus();
-    canvas.setPointerCapture(e.pointerId);
-    // Joining/leaving fingers changes gesture mode without changing the camera.
-    touchPointers.set(e.pointerId, {x:e.clientX,y:e.clientY});
-    return;
-  }
-  if (drag || touchPointers.size) return;
+  if (!ready || drag || calibrationDragging) return;
   canvas.focus();
   canvas.setPointerCapture(e.pointerId);
   drag = { x: e.clientX, y: e.clientY, pan: e.button === 2 || e.shiftKey, id: e.pointerId };
 });
 canvas.addEventListener('pointermove', (e) => {
-  if (!ready || loading || stopped || calibrationDragging) return;
-  if (e.pointerType === 'touch') {
-    const previous = touchPointers.get(e.pointerId);
-    if (!previous) return;
-    const pair = touchPointers.size === 2 ? touchPair() : null;
-    touchPointers.set(e.pointerId, {x:e.clientX,y:e.clientY});
-    if (pair) {
-      const next = touchPair();
-      pan(next.x-pair.x, next.y-pair.y);
-      const scale = baseSpeed * Math.pow(10, Number($('speed').value)) * 0.006;
-      move(camera.forward, (next.span-pair.span)*scale);
-    } else turn(e.clientX-previous.x, e.clientY-previous.y);
-    return;
-  }
-  if (!drag || e.pointerId !== drag.id) return;
+  if (!drag || !ready || e.pointerId !== drag.id) return;
   const dx = e.clientX-drag.x, dy = e.clientY-drag.y;
-  if (drag.pan) pan(dx, dy);
-  else turn(dx, dy);
+  if (drag.pan) {
+    const scale = baseSpeed * Math.pow(10, Number($('speed').value)) * 0.006;
+    move(camera.right, -dx*scale); move(camera.down, -dy*scale);
+  } else turn(dx, dy);
   drag.x = e.clientX; drag.y = e.clientY;
 });
-canvas.addEventListener('pointerup', (e) => {
-  touchPointers.delete(e.pointerId);
-  if (drag?.id === e.pointerId) drag = null;
-});
-for (const name of ['pointercancel', 'lostpointercapture']) canvas.addEventListener(name, (e) => {
-  if (touchPointers.has(e.pointerId) || drag?.id === e.pointerId) clearPointerState();
-});
+for (const name of ['pointerup', 'pointercancel', 'lostpointercapture']) canvas.addEventListener(name, () => { drag = null; });
 canvas.addEventListener('wheel', (e) => {
   e.preventDefault();
   if (ready && !calibrationDragging) move(camera.forward, -Math.sign(e.deltaY)*baseSpeed*Math.pow(10, Number($('speed').value))*0.2);
@@ -456,12 +390,13 @@ window.addEventListener('keydown', (e) => {
   if (['KeyW','KeyA','KeyS','KeyD','KeyQ','KeyE','ShiftLeft','ShiftRight'].includes(e.code)) { e.preventDefault(); keys.add(e.code); }
 });
 window.addEventListener('keyup', (e) => keys.delete(e.code));
-window.addEventListener('blur', () => { keys.clear(); clearPointerState(); });
-document.addEventListener('visibilitychange', () => { keys.clear(); clearPointerState(); frameTimes = []; dirty = true; });
+window.addEventListener('blur', () => { keys.clear(); drag = null; });
+document.addEventListener('visibilitychange', () => { keys.clear(); frameTimes = []; dirty = true; });
 window.addEventListener('resize', () => { adaptive.markMotion(performance.now()); markCameraChanged(true); updateGizmo(); });
 $('resolution').addEventListener('change', () => { frameTimes = []; dirty = true; });
 $('adaptive').addEventListener('change', () => { frameTimes = []; dirty = true; });
 $('target-fps').addEventListener('change', () => { adaptive.setTarget(Number($('target-fps').value)); dirty = true; });
+$('render-mode').addEventListener('change', () => { adaptive.reset(); frameTimes = []; dirty = true; });
 $('fov').addEventListener('change', () => {
   if (!ready) return;
   const value = Math.min(120, Math.max(20, Number($('fov').value) || 70));
@@ -572,7 +507,7 @@ $('save').addEventListener('click', async () => {
     const blob = await new Promise((resolve) => output.toBlob(resolve, 'image/png'));
     if (stopped) return;
     const url = URL.createObjectURL(blob), a = document.createElement('a');
-    a.href = url; a.download = `${currentId}-webgl2.png`; a.click();
+    a.href = url; a.download = `${currentId}-webgpu.png`; a.click();
     setTimeout(() => URL.revokeObjectURL(url), 1000);
   } catch (error) { message(error); }
   finally { capturing = false; $('save').disabled = !ready || loading; }
@@ -591,9 +526,8 @@ async function frame(time) {
     if (keys.has('KeyE')) move(worldUp, speed);
     if (keys.has('KeyQ')) move(worldUp, -speed);
     const choice = adaptive.select(Number($('resolution').value), performance.now(), $('adaptive').checked);
-    const aspect = canvas.clientWidth / Math.max(1, canvas.clientHeight);
-    const width = aspect >= 1 ? choice.width : Math.max(1, Math.round(choice.width * aspect));
-    const height = aspect >= 1 ? Math.max(1, Math.round(choice.width / aspect)) : choice.width;
+    const width = choice.width;
+    const height = Math.max(1, Math.min(1920, Math.round(width*canvas.clientHeight/canvas.clientWidth)));
     // After motion settles, render one full-resolution frame even if no
     // further input event occurred. Continuing idle frames remains optional.
     const restoreFull = !choice.moving && canvas.dataset.quality === 'moving';
@@ -603,14 +537,15 @@ async function frame(time) {
         const frameCamera = copyCamera(camera);
         const frameRevision = cameraRevision;
         renderer.setCamera(frameCamera);
-        const result = await renderer.render({ width, height });
+        const mode = $('render-mode').value;
+        const modeLabel = $('render-mode').selectedOptions[0].textContent;
+        const result = await renderer.render({ width, height, mode });
         if (stopped) return;
         lastMainCamera = frameCamera;
         mainRevision = frameRevision;
         updateGizmo();
         adaptive.record(result, choice.moving);
         canvas.dataset.quality = choice.moving ? 'moving' : 'full';
-        canvas.style.visibility = 'visible';
         rendered = true;
         $('save').disabled = loading || capturing;
         const done = performance.now();
@@ -618,7 +553,7 @@ async function frame(time) {
         const fps = frameTimes.length > 1 ? (frameTimes.length-1)*1000/(done-frameTimes[0]) : null;
         if (done-lastUiUpdate > 200 || !$('continuous').checked) {
           $('stats').textContent = `${width} × ${height} · ${result.renderMs.toFixed(1)} ms / 完成帧${Number.isFinite(result.gpuMs) ? ` · GPU ≈ ${result.gpuMs.toFixed(1)} ms` : ''}${fps !== null ? ` · ${fps.toFixed(1)} FPS` : ''}`;
-          $('quality').textContent = `${choice.moving ? '交互分辨率' : '完整分辨率'} · WebGL2 Gaussian Splatting${result.accumulation === 'unorm8' ? ' · 兼容色彩精度' : ''}`;
+          $('quality').textContent = `${choice.moving ? '交互分辨率' : '完整分辨率'} · ${modeLabel}`;
           lastUiUpdate = done;
         }
       } catch (error) { ready = false; message(error); }
@@ -664,13 +599,13 @@ async function frame(time) {
 }
 
 async function main() {
-  if (!isSecureContext) throw new Error('请通过 HTTPS 或 localhost 打开，以便后台加载和校验模型文件。');
-  rendererInitialization = WebGlSplatRenderer.create(canvas);
+  if (!isSecureContext || !navigator.gpu) throw new Error('此页面需要支持 WebGPU 的浏览器，并通过 HTTPS 或 localhost 打开。请使用启用了硬件加速的 Chrome / Edge。');
+  rendererInitialization = WebGpuRayRenderer.create(canvas);
   renderer = await rendererInitialization;
   if (stopped) { renderer.dispose(); return; }
   const info = renderer.adapterInfo || {};
-  $('adapter').textContent = info.label || 'WebGL2 · 本机显卡';
-  renderer.lostPromise.then((info) => {
+  $('adapter').textContent = [info.vendor, info.architecture, info.device, info.description].filter(Boolean).join(' · ') || 'WebGPU · 本机显卡';
+  renderer.device.lost.then((info) => {
     if (stopped) return;
     if (info.reason !== 'destroyed') message(`显卡连接中断：${info.message}。请降低分辨率后刷新。`);
     stopViewer();
@@ -685,7 +620,7 @@ async function main() {
     const data = await fetchJson(new URL('./models.json', document.baseURI), loadController.signal);
     if (stopped) return;
     catalog = data.models;
-    if (!Array.isArray(catalog) || !catalog.length) throw new Error('models.json 中没有模型，请先导出 WebGL2 模型并生成模型列表');
+    if (!Array.isArray(catalog) || !catalog.length) throw new Error('models.json 中没有模型，请先运行 export_model.py 并生成模型列表');
     defaultId = params.get('model') || data.default || catalog[0].id;
   }
   $('model').replaceChildren(...catalog.map((entry) => new Option(entry.name || entry.id, entry.id)));

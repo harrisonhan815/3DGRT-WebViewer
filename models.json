@@ -4,12 +4,7 @@
     {
       "id": "fc-room1",
       "name": "room1",
-      "url": "models/fc-room1/manifest.json"
-    },
-    {
-      "id": "fc-lounge",
-      "name": "lounge",
-      "url": "models/fc-lounge/manifest.json"
+      "url": "models/fc-room1-webgl2/manifest.json"
     }
   ]
 }

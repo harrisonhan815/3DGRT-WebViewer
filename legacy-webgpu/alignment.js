@@ -77,8 +77,7 @@ export function frameDistance(manifest,camera) {
   const distances=(manifest.cameras??[]).map(p=>Math.hypot(...p.position.map((v,i)=>v-camera.position[i])))
     .filter(d=>Number.isFinite(d)&&d>1e-6).sort((a,b)=>a-b);
   if (distances.length>2) return Math.max(1e-3,distances[Math.floor(distances.length/2)]*0.3);
-  const bounds = manifest.navigation_bounds ?? manifest.bounds;
-  return Math.max(1e-3,Math.hypot(...bounds.max.map((v,i)=>v-bounds.min[i]))*0.2);
+  return Math.max(1e-3,Math.hypot(...manifest.bounds.max.map((v,i)=>v-manifest.bounds.min[i]))*0.2);
 }
 
 export function referenceCamera(manifest) {

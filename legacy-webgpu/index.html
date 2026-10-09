@@ -11,7 +11,7 @@
   <canvas id="view" tabindex="0" aria-label="三维场景，拖动转向，WASD 移动"></canvas>
   <div id="alignment-overlay" aria-label="参考地面和三轴校正工具"></div>
   <aside id="panel">
-    <header><strong>3DGRT Viewer</strong><span>WebGL2 Gaussian Splatting</span></header>
+    <header><strong>3DGRT Viewer</strong><span>WebGPU 光追预览</span></header>
     <label>模型<select id="model" disabled></select></label>
     <label>相机<select id="camera" disabled></select></label>
     <details id="alignment-controls">
@@ -23,11 +23,15 @@
       <p class="help">拖动红 / 绿 / 蓝箭头沿 X / Y / Z 平移，拖动圆环绕对应轴旋转。松开后应用；Esc 取消本次拖动。Y 轴是地面法线，原点是观察中心。</p>
       <p id="align-status" role="status" aria-live="polite" data-state="absent">等待模型</p>
     </details>
+    <label>渲染方式<select id="render-mode">
+      <option value="bvh" selected>BVH 光追</option>
+      <option value="tiled">屏幕分块光追</option>
+    </select></label>
     <div class="row">
-      <label>静止渲染长边<select id="resolution">
+      <label>静止渲染宽度<select id="resolution">
         <option value="320">320 px</option><option value="480">480 px</option>
-        <option value="640" selected>640 px</option><option value="720">720 px</option>
-        <option value="960">960 px</option><option value="1280">1280 px</option><option value="1920">1920 px</option>
+        <option value="640" selected>640 px</option><option value="960">960 px</option>
+        <option value="1280">1280 px</option><option value="1920">1920 px</option>
       </select></label>
       <label>视场角<input id="fov" type="number" min="20" max="120" value="70" step="1"></label>
     </div>
@@ -40,9 +44,9 @@
     <div class="row buttons"><button id="reset" disabled>重置视角</button><button id="save" disabled>保存图片</button></div>
     <label class="check"><input id="continuous" type="checkbox">持续渲染 / 测帧率</label>
     <p id="details">等待载入模型</p>
-    <p id="stats" title="FPS 为连续完成帧率；GPU 为可用时的绘制采样；不支持计时时只显示完成帧耗时。">—</p>
+    <p id="stats" title="FPS 为连续完成帧率；GPU 为最近一次计算阶段采样，默认每 30 帧更新。">—</p>
     <p id="quality" class="muted"></p>
-    <p class="help">左键拖动转向 · 右键拖动平移 · 滚轮前后<br>WASD 移动 · Q/E 上下 · Shift 加速<br>触屏：单指转向 · 双指平移 · 捏合前后</p>
+    <p class="help">左键拖动转向 · 右键拖动平移 · 滚轮前后<br>WASD 移动 · Q/E 上下 · Shift 加速</p>
     <p id="adapter" class="muted"></p>
   </aside>
   <button id="toggle" aria-label="展开或收起控制栏">☰</button>
@@ -52,7 +56,7 @@
     <canvas id="fisheye-view" width="192" height="192" aria-label="跟随主相机位姿的180度等距鱼眼图像" hidden></canvas>
     <p id="fisheye-status" aria-live="polite">等待当前视角</p>
   </section>
-  <div id="loading" role="status"><strong id="load-title">正在初始化 WebGL2</strong><progress id="progress"></progress><span id="load-detail">模型将在本机显卡上渲染</span></div>
+  <div id="loading" role="status"><strong id="load-title">正在初始化 WebGPU</strong><progress id="progress"></progress><span id="load-detail">模型将在本机显卡上渲染</span></div>
   <div id="error" role="alert" hidden></div>
   <section id="exit-panel" role="status" aria-live="polite" tabindex="-1" hidden>
     <strong id="exit-title">正在安全退出</strong>

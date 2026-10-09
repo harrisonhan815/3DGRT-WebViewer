@@ -47,11 +47,4 @@ body.collapsed #toggle { left: 16px; }
 #loading span { font-size: 13px; color: #9aabbc; overflow-wrap: anywhere; }
 progress { width: min(360px, 75vw); accent-color: #86bdff; }
 #error { position: fixed; bottom: 24px; left: 50%; transform: translateX(-50%); width: min(680px, 90vw); padding: 18px; border: 1px solid #be7474; border-radius: 8px; background: #351f24ee; color: #ffd9d9; white-space: pre-wrap; overflow-wrap: anywhere; font-size: 14px; }
-#loading, #error { z-index: 3; }
-#exit-panel { z-index: 4; }
 @media (max-width: 580px) { aside { width: 250px; } #toggle { left: 282px; } }
-@media (pointer: coarse) and (max-width: 900px) {
-  #panel { max-height: calc(100dvh - 32px); }
-  #safe-exit { top: 16px; }
-  body:not(.collapsed) #toggle { top: 64px; left: auto; right: 16px; }
-}

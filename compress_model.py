@@ -3,7 +3,7 @@
 
 No checkpoint, model rebuild or Gaussian filtering is involved. The default
 preserves the SH dtype and bits; --sh-dtype float16 explicitly quantizes SH.
-Geometry and BVH bytes remain unchanged. Camera/identity metadata and
+Geometry bytes remain unchanged. Camera/identity metadata and
 alignment.json are retained. Expanding float16 to float32 cannot recover detail
 lost by the previous half-precision conversion.
 Existing output paths are never overwritten.
@@ -86,8 +86,19 @@ def compress_model(source, output, *, compression="gzip-shuffle", chunk_bytes=64
     if sh_dtype not in ("preserve", *SH_DTYPES):
         raise ValueError("SH dtype must be preserve, float16 or float32")
     manifest = json.loads((source / "manifest.json").read_text())
-    if manifest.get("schema") != SCHEMA or set(manifest.get("files", {})) != {"geometry", "sh", "bvh"}:
-        raise ValueError("Input must be a FullCircle reference WebGPU model manifest")
+    if manifest.get("schema") != SCHEMA or set(manifest.get("files", {})) != {"geometry", "sh"}:
+        raise ValueError("Input must be a FullCircle quadratic WebGL2 EWA model manifest")
+    render = manifest.get("render", {})
+    if (render.get("method") != "3dgs" or render.get("kernel_degree") != 2
+            or render.get("depth_sort") != "radial"):
+        raise ValueError("Input must describe radial-sorted quadratic 3DGS, not a converted ray tracer")
+    geometry = manifest["files"]["geometry"]
+    count = manifest.get("gaussian_count")
+    if (type(count) is not int or count < 1 or geometry.get("stride") != 48
+            or geometry.get("byteLength") != count * 48):
+        raise ValueError("Geometry count, byteLength and 48-byte covariance records must agree")
+    if any(spec.get("byte_order", "little-endian") != "little-endian" for spec in manifest["files"].values()):
+        raise ValueError("All model buffers must use little-endian byte order")
     source_sh = manifest["files"]["sh"]
     if (manifest.get("byte_order", "little-endian") != "little-endian"
             or source_sh.get("byte_order", "little-endian") != "little-endian"):

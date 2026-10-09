@@ -1,671 +1,589 @@
-// Browser-only FP32 math for reference/instances quartic 3DGRT rendering.
-// SH coefficients may use FP32 or packed FP16 storage; geometry stays FP32.
-// See trace.wgsl for the upstream equation attribution and license.
+/*
+ * EWA projection, Gaussian evaluation and SH basis follow the 3DGS reference:
+ * Copyright (C) 2023, Inria / GRAPHDECO. All rights reserved.
+ * Research, evaluation and non-commercial use under the reference LICENSE.md:
+ * See LICENSE-3DGS.md (from thirdparty/DirectFisheye-GS/LICENSE.md).
+ * The browser implementation below retains the reference's 16-pixel tile
+ * bounds and 0.3-pixel covariance filter. Fixed-function blending cannot
+ * reproduce the CUDA kernel's per-pixel early transmittance termination.
+ */
 
-const PRESENT_SHADER = `
-@group(0) @binding(0) var image: texture_2d<f32>;
-@vertex fn vertexMain(@builtin(vertex_index) index: u32) -> @builtin(position) vec4<f32> {
-    let vertices = array<vec2<f32>, 3>(vec2<f32>(-1.0, -1.0), vec2<f32>(3.0, -1.0), vec2<f32>(-1.0, 3.0));
-    return vec4<f32>(vertices[index], 0.0, 1.0);
+const EWA_VERTEX = `#version 300 es
+precision highp float;
+precision highp int;
+layout(location=0) in uint a_index;
+uniform highp sampler2D u_geometry;
+uniform highp sampler2D u_sh;
+uniform int u_geometryWidth;
+uniform int u_shWidth;
+uniform vec3 u_position;
+uniform vec3 u_right;
+uniform vec3 u_down;
+uniform vec3 u_forward;
+uniform vec2 u_size;
+uniform vec2 u_focal;
+uniform vec2 u_principal;
+uniform vec2 u_tanFov;
+uniform float u_near;
+uniform float u_lowPass;
+uniform float u_minAlpha;
+uniform int u_projection;
+uniform int u_degree;
+uniform bool u_antialias;
+flat out vec2 v_center;
+flat out vec3 v_conic;
+flat out vec4 v_colorOpacity;
+
+vec4 geom(int offset) {
+  int n = int(a_index)*3 + offset;
+  return texelFetch(u_geometry, ivec2(n % u_geometryWidth, n / u_geometryWidth), 0);
 }
-@fragment fn fragmentMain(@builtin(position) position: vec4<f32>) -> @location(0) vec4<f32> {
-    return textureLoad(image, vec2<i32>(position.xy), 0);
+vec4 shTexel(int n) {
+  return texelFetch(u_sh, ivec2(n % u_shWidth, n / u_shWidth), 0);
+}
+vec3 coefficient(int k) {
+  int scalar = int(a_index)*48 + 3*k;
+  int lane = scalar % 4;
+  int texel = scalar / 4;
+  vec4 a = shTexel(texel);
+  if (lane == 0) return a.xyz;
+  if (lane == 1) return a.yzw;
+  vec4 b = shTexel(texel+1);
+  if (lane == 2) return vec3(a.zw,b.x);
+  return vec3(a.w,b.xy);
+}
+vec3 shColor(vec3 direction) {
+  float x=direction.x, y=direction.y, z=direction.z;
+  vec3 rgb = 0.28209479177387814 * coefficient(0);
+  if (u_degree > 0) {
+    rgb += -0.4886025119029199*y*coefficient(1)
+           +0.4886025119029199*z*coefficient(2)
+           -0.4886025119029199*x*coefficient(3);
+  }
+  if (u_degree > 1) {
+    float xx=x*x, yy=y*y, zz=z*z;
+    rgb += 1.0925484305920792*x*y*coefficient(4)
+           -1.0925484305920792*y*z*coefficient(5)
+           +0.31539156525252005*(2.0*zz-xx-yy)*coefficient(6)
+           -1.0925484305920792*x*z*coefficient(7)
+           +0.5462742152960396*(xx-yy)*coefficient(8);
+    if (u_degree > 2) {
+      rgb += -0.5900435899266435*y*(3.0*xx-yy)*coefficient(9)
+             +2.890611442640554*x*y*z*coefficient(10)
+             -0.4570457994644658*y*(4.0*zz-xx-yy)*coefficient(11)
+             +0.3731763325901154*z*(2.0*zz-3.0*xx-3.0*yy)*coefficient(12)
+             -0.4570457994644658*x*(4.0*zz-xx-yy)*coefficient(13)
+             +1.445305721320277*z*(xx-yy)*coefficient(14)
+             -0.5900435899266435*x*(xx-3.0*yy)*coefficient(15);
+    }
+  }
+  return max(rgb+0.5,vec3(0.0));
+}
+bool finiteVec(vec3 v) { return !any(isnan(v)) && !any(isinf(v)); }
+void main() {
+  gl_Position=vec4(0.0,0.0,2.0,1.0);
+  v_center=vec2(0.0); v_conic=vec3(1.0,0.0,1.0); v_colorOpacity=vec4(0.0);
+  vec4 g0=geom(0);
+  // With AA compensation disabled, opacity is an upper bound on every
+  // pixel's alpha. This skips only splats the reference would discard at
+  // every pixel; the stored model and the sort order remain unchanged.
+  if (!u_antialias && g0.w < u_minAlpha) return;
+  vec4 g1=geom(1), g2=geom(2);
+  vec3 relative=g0.xyz-u_position;
+  vec3 p=vec3(dot(relative,u_right),dot(relative,u_down),dot(relative,u_forward));
+  float distanceToCamera=length(p);
+  vec2 center;
+  vec3 ju,jv;
+  if (u_projection == 0) {
+    if (p.z <= u_near) return;
+    // The homogeneous reference adds 1e-7 to w before ndc2Pix.
+    center = u_focal*p.xy/(p.z+1e-7)+u_principal-0.5;
+    vec2 bounded=clamp(p.xy/p.z,-1.3*u_tanFov,1.3*u_tanFov);
+    ju=vec3(u_focal.x/p.z,0.0,-u_focal.x*bounded.x/p.z);
+    jv=vec3(0.0,u_focal.y/p.z,-u_focal.y*bounded.y/p.z);
+  } else {
+    if (distanceToCamera <= u_near) return;
+    float q=dot(p.xy,p.xy), r=sqrt(q);
+    float theta=atan(r,p.z);
+    if (theta > 1.5707963267948966) return;
+    float h,hq,hz;
+    if (p.z > 0.0 && q < 1e-4*p.z*p.z) {
+      float w=q/(p.z*p.z), zi=1.0/p.z;
+      float poly=1.0+w*(-1.0/3.0+w*(1.0/5.0+w*(-1.0/7.0+w/9.0)));
+      float dp=-1.0/3.0+w*(2.0/5.0+w*(-3.0/7.0+w*4.0/9.0));
+      h=poly*zi; hq=dp*zi*zi*zi; hz=-(poly+2.0*w*dp)*zi*zi;
+    } else {
+      float inv=1.0/dot(p,p);
+      h=theta/r; hq=(p.z*inv-h)/(2.0*q); hz=-inv;
+    }
+    center=u_focal*(p.xy*h)+u_principal-0.5;
+    ju=u_focal.x*vec3(h+2.0*p.x*p.x*hq,2.0*p.x*p.y*hq,p.x*hz);
+    jv=u_focal.y*vec3(2.0*p.x*p.y*hq,h+2.0*p.y*p.y*hq,p.y*hz);
+  }
+  vec3 gu=u_right*ju.x+u_down*ju.y+u_forward*ju.z;
+  vec3 gv=u_right*jv.x+u_down*jv.y+u_forward*jv.z;
+  mat3 covariance=mat3(g1.x,g1.y,g1.z, g1.y,g1.w,g2.x, g1.z,g2.x,g2.y);
+  float a=dot(gu,covariance*gu), b=dot(gu,covariance*gv), c=dot(gv,covariance*gv);
+  float rawDet=a*c-b*b;
+  a+=u_lowPass; c+=u_lowPass;
+  float det=a*c-b*b;
+  if (det == 0.0 || isnan(det) || isinf(det)) return;
+  vec3 conic=vec3(c,-b,a)/det;
+  float mid=0.5*(a+c);
+  float radius=ceil(3.0*sqrt(mid+sqrt(max(0.1,mid*mid-det))));
+  if (isnan(radius) || isinf(radius) || !finiteVec(vec3(center,0.0)) || !finiteVec(conic)) return;
+  // The CUDA rasterizer visits complete 16x16 tiles, including Gaussian tails
+  // outside the nominal 3-sigma ellipse. Float truncation avoids integer
+  // overflow for enormous but finite projected radii before clipping.
+  vec2 grid=ceil(u_size/16.0);
+  vec2 lo=clamp(trunc((center-radius)/16.0),vec2(0.0),grid)*16.0;
+  vec2 hi=clamp(trunc((center+radius+15.0)/16.0),vec2(0.0),grid)*16.0;
+  if (any(lessThanEqual(hi,lo))) return;
+  vec2 corner=vec2(float(gl_VertexID & 1),float((gl_VertexID >> 1) & 1));
+  vec2 edge=mix(lo,hi,corner);
+  gl_Position=vec4(2.0*edge.x/u_size.x-1.0,1.0-2.0*edge.y/u_size.y,0.0,1.0);
+  v_center=center;
+  v_conic=conic;
+  float opacity=g0.w;
+  if (u_antialias) opacity*=sqrt(max(0.000025,rawDet/det));
+  vec3 direction=relative/max(length(relative),1e-30);
+  v_colorOpacity=vec4(shColor(direction),opacity);
 }`;
 
-function exactInteger(value, label, minimum = 1) {
-    if (!Number.isSafeInteger(value) || value < minimum) throw new Error(`${label} must be an integer >= ${minimum}.`);
-    return value;
+const EWA_FRAGMENT = `#version 300 es
+precision highp float;
+precision highp int;
+uniform vec2 u_size;
+uniform float u_minAlpha;
+uniform float u_maxAlpha;
+uniform int u_projection;
+flat in vec2 v_center;
+flat in vec3 v_conic;
+flat in vec4 v_colorOpacity;
+out vec4 outColor;
+void main() {
+  vec2 pixel=vec2(gl_FragCoord.x-0.5,u_size.y-gl_FragCoord.y-0.5);
+  if (u_projection == 1 && length(pixel+0.5-u_size*0.5)>min(u_size.x,u_size.y)*0.5) discard;
+  vec2 d=v_center-pixel;
+  float power=-0.5*(v_conic.x*d.x*d.x+v_conic.z*d.y*d.y)-v_conic.y*d.x*d.y;
+  if (power > 0.0) discard;
+  float alpha=min(u_maxAlpha,v_colorOpacity.a*exp(power));
+  if (alpha < u_minAlpha) discard;
+  outColor=vec4(v_colorOpacity.rgb*alpha,alpha);
+}`;
+
+const QUAD_VERTEX = `#version 300 es
+precision highp float;
+out vec2 uv;
+void main() {
+  vec2 p=vec2(float((gl_VertexID << 1) & 2),float(gl_VertexID & 2));
+  uv=p; gl_Position=vec4(p*2.0-1.0,0.0,1.0);
+}`;
+const RESOLVE_FRAGMENT = `#version 300 es
+precision highp float;
+uniform highp sampler2D u_image;
+uniform vec3 u_background;
+uniform vec2 u_size;
+uniform int u_projection;
+in vec2 uv;
+out vec4 color;
+void main() {
+  if (u_projection == 1 && length((uv-0.5)*u_size)>min(u_size.x,u_size.y)*0.5) {
+    color=vec4(0.0,0.0,0.0,1.0); return;
+  }
+  vec4 splats=texture(u_image,uv);
+  color=vec4(splats.rgb+(1.0-splats.a)*u_background,1.0);
+}`;
+
+function abortError() { return new DOMException('Renderer stopped.', 'AbortError'); }
+function vector(value, name) {
+  if (!value || value.length !== 3 || !Array.from(value).every(Number.isFinite)) throw new Error(`Invalid camera ${name}.`);
+  return Array.from(value);
+}
+function copyCamera(camera) {
+  if (!camera || !(camera.tanHalfFovY > 0) || !Number.isFinite(camera.tanHalfFovY)) throw new Error('Invalid camera field of view.');
+  return {position:vector(camera.position,'position'),right:vector(camera.right,'right'),
+    down:vector(camera.down,'down'),forward:vector(camera.forward,'forward'),tanHalfFovY:camera.tanHalfFovY};
+}
+export function shStorageFormat(metadata = {}) {
+  const file=metadata.files?.sh;
+  const dtype=file?.dtype ?? 'float32';
+  if (!['float16','float32'].includes(dtype)) throw new Error(`Unsupported SH dtype: ${dtype}.`);
+  const stride=dtype==='float16'?96:192;
+  if (file?.stride !== undefined && file.stride !== stride) throw new Error('SH stride does not match its dtype.');
+  if (metadata.byte_order !== undefined && metadata.byte_order !== 'little-endian') throw new Error('Only little-endian model data is supported.');
+  return {dtype,stride,packed:dtype==='float16'};
+}
+function program(gl, vertexSource, fragmentSource) {
+  const shaders=[];
+  let result;
+  try {
+    for (const [type, source] of [[gl.VERTEX_SHADER,vertexSource],[gl.FRAGMENT_SHADER,fragmentSource]]) {
+      const shader=gl.createShader(type);
+      shaders.push(shader);
+      gl.shaderSource(shader,source); gl.compileShader(shader);
+      if (!gl.getShaderParameter(shader,gl.COMPILE_STATUS)) throw new Error(gl.getShaderInfoLog(shader)||'WebGL shader compilation failed.');
+    }
+    result=gl.createProgram();
+    for(const shader of shaders) gl.attachShader(result,shader);
+    gl.linkProgram(result);
+    if (!gl.getProgramParameter(result,gl.LINK_STATUS)) throw new Error(gl.getProgramInfoLog(result)||'WebGL program link failed.');
+    const uniforms={};
+    for(let i=0;i<gl.getProgramParameter(result,gl.ACTIVE_UNIFORMS);i++) {
+      const info=gl.getActiveUniform(result,i);
+      uniforms[info.name]=gl.getUniformLocation(result,info.name);
+    }
+    return {program:result,uniforms};
+  } catch(error) {
+    if(result) gl.deleteProgram(result);
+    throw error;
+  } finally { for(const shader of shaders) gl.deleteShader(shader); }
 }
 
-function finiteVector(value, size, label) {
-    if (!value || value.length !== size || !Array.from(value).every(Number.isFinite)) {
-        throw new Error(`${label} must contain ${size} finite numbers.`);
+export class WebGlSplatRenderer {
+  static async create(canvas) {
+    const gl=canvas.getContext('webgl2',{alpha:false,antialias:false,depth:false,stencil:false,
+      premultipliedAlpha:false,preserveDrawingBuffer:false,powerPreference:'high-performance'});
+    if (!gl) throw new Error('此浏览器无法创建 WebGL2 上下文；请启用硬件加速或更换支持 WebGL2 的浏览器。');
+    const renderer=new WebGlSplatRenderer(canvas,gl);
+    try { renderer._initialize(); return renderer; }
+    catch(error) { renderer.dispose(); throw error; }
+  }
+  constructor(canvas,gl) {
+    this.canvas=canvas; this.gl=gl;
+    this.disposed=false; this.closing=false; this.rendering=false;
+    this.width=0; this.height=0; this.generation=0; this.requestId=0;
+    this.model=null; this.target=null; this.previewTarget=null; this.sortPending=null;
+    this._syncWaits=new Set(); this._queries=new Set();
+    this.lostPromise=new Promise(resolve=>{this._resolveLost=resolve;});
+    this._lostHandler=event=>{
+      event.preventDefault();
+      this._resolveLost({reason:'context-lost',message:'WebGL context lost. Reload this page to recreate it.'});
+      this.dispose(false);
+    };
+    canvas.addEventListener('webglcontextlost',this._lostHandler);
+  }
+  _initialize() {
+    const gl=this.gl;
+    this.limits={maxTextureSize:gl.getParameter(gl.MAX_TEXTURE_SIZE),
+      maxRenderbufferSize:gl.getParameter(gl.MAX_RENDERBUFFER_SIZE)};
+    this.limits.maxTexturePixels=this.limits.maxTextureSize**2;
+    const debug=gl.getExtension('WEBGL_debug_renderer_info');
+    this.adapterInfo={label:debug?gl.getParameter(debug.UNMASKED_RENDERER_WEBGL):gl.getParameter(gl.RENDERER)};
+    this.floatColor=gl.getExtension('EXT_color_buffer_float');
+    this.halfColor=gl.getExtension('EXT_color_buffer_half_float');
+    this.floatBlend=this.floatColor && gl.getExtension('EXT_float_blend');
+    this.accumulation=this.floatBlend?'float32':(this.floatColor||this.halfColor?'float16':'unorm8');
+    this.timer=gl.getExtension('EXT_disjoint_timer_query_webgl2');
+    this.ewa=program(gl,EWA_VERTEX,EWA_FRAGMENT);
+    this.resolve=program(gl,QUAD_VERTEX,RESOLVE_FRAGMENT);
+    this.emptyVao=gl.createVertexArray();
+    gl.disable(gl.DEPTH_TEST); gl.disable(gl.CULL_FACE); gl.disable(gl.DITHER);
+    gl.pixelStorei(gl.UNPACK_ALIGNMENT,4);
+    this._checkError('initialization');
+  }
+  _assertAlive() { if(this.disposed||this.closing) throw abortError(); }
+  _checkError(action) {
+    const error=this.gl.getError();
+    if(error!==this.gl.NO_ERROR) throw new Error(`WebGL ${action} failed (0x${error.toString(16)}).`);
+  }
+  validateModel(metadata) {
+    this._assertAlive();
+    if(metadata?.schema!=='fullcircle-webgl2-ewa-v1') throw new Error('This renderer requires a fullcircle-webgl2-ewa-v1 model.');
+    const count=metadata.gaussian_count;
+    if(!Number.isSafeInteger(count)||count<=0||count>0x7fffffff/48) throw new Error('Invalid Gaussian count.');
+    const format=shStorageFormat(metadata);
+    const geometryBytes=count*48,shBytes=count*format.stride;
+    if(metadata.files?.geometry?.stride!==undefined&&metadata.files.geometry.stride!==48) throw new Error('Expected 48-byte covariance geometry records.');
+    for(const [name,expected] of [['geometry',geometryBytes],['sh',shBytes]]) {
+      const declared=metadata.files?.[name]?.byteLength;
+      if(declared!==undefined&&declared!==expected) throw new Error(`${name} byteLength does not match Gaussian count.`);
     }
-    return Array.from(value);
-}
-
-function bytesOf(value, label) {
-    if (value instanceof ArrayBuffer) return new Uint8Array(value);
-    if (ArrayBuffer.isView(value)) return new Uint8Array(value.buffer, value.byteOffset, value.byteLength);
-    throw new Error(`${label} must be an ArrayBuffer or typed array.`);
-}
-
-export function shStorageFormat(metadata) {
-    if (!metadata || typeof metadata !== "object" || Array.isArray(metadata)) throw new Error("Expected model metadata.");
-    if (metadata.byte_order !== undefined && metadata.byte_order !== "little-endian") {
-        throw new Error("Model buffers must use little-endian byte order.");
+    if(count*12>this.limits.maxTexturePixels) throw new Error(`SH texture exceeds this device's ${this.limits.maxTextureSize}² texture limit.`);
+    const render=metadata.render||{};
+    if(render.depth_sort!==undefined&&render.depth_sort!=='radial') throw new Error('This model requires unsupported non-radial sorting.');
+    if(render.sh_degree!==undefined&&(!Number.isInteger(render.sh_degree)||render.sh_degree<0||render.sh_degree>3)) throw new Error('SH degree must be between 0 and 3.');
+    if(render.kernel_degree!==undefined&&render.kernel_degree!==2) throw new Error('Only the quadratic 3DGS Gaussian kernel is supported.');
+    if(render.sh_direction!==undefined&&render.sh_direction!=='camera_to_gaussian') throw new Error('Unsupported SH direction.');
+    for(const name of ['low_pass_variance','near_plane','min_alpha','max_alpha']) {
+      if(render[name]!==undefined&&(!Number.isFinite(render[name])||render[name]<0)) throw new Error(`Invalid render parameter ${name}.`);
     }
-    // Small programmatic scenes predating manifest files remain valid FP32
-    // inputs. New FP16 files must declare their type explicitly.
-    const file = metadata.files?.sh;
-    if (metadata.files !== undefined && (!file || typeof file !== "object" || Array.isArray(file))) {
-        throw new Error("Model metadata is missing the SH file description.");
+    if(render.background!==undefined) vector(render.background,'background');
+    return {geometryBytes,shBytes,totalBytes:geometryBytes+shBytes,shDtype:format.dtype};
+  }
+  _dataTexture(values,texels,half=false) {
+    const gl=this.gl;
+    const width=Math.min(this.limits.maxTextureSize,Math.max(1,Math.min(texels,4096),Math.ceil(texels/this.limits.maxTextureSize)));
+    const height=Math.ceil(texels/width);
+    if(height>this.limits.maxTextureSize) throw new Error('Model texture exceeds device limits.');
+    let data=values;
+    if(values.length!==width*height*4) { data=new values.constructor(width*height*4); data.set(values); }
+    const texture=gl.createTexture();
+    gl.bindTexture(gl.TEXTURE_2D,texture);
+    gl.texParameteri(gl.TEXTURE_2D,gl.TEXTURE_MIN_FILTER,gl.NEAREST);
+    gl.texParameteri(gl.TEXTURE_2D,gl.TEXTURE_MAG_FILTER,gl.NEAREST);
+    gl.texParameteri(gl.TEXTURE_2D,gl.TEXTURE_WRAP_S,gl.CLAMP_TO_EDGE);
+    gl.texParameteri(gl.TEXTURE_2D,gl.TEXTURE_WRAP_T,gl.CLAMP_TO_EDGE);
+    gl.texImage2D(gl.TEXTURE_2D,0,half?gl.RGBA16F:gl.RGBA32F,width,height,0,gl.RGBA,half?gl.HALF_FLOAT:gl.FLOAT,data);
+    try { this._checkError('model texture upload'); return {texture,width,height}; }
+    catch(error) { gl.deleteTexture(texture); throw error; }
+  }
+  async loadModel({geometry,sh,metadata}) {
+    this._assertAlive();
+    if(this.rendering) throw new Error('Wait for the current frame before loading a model.');
+    const sizes=this.validateModel(metadata),format=shStorageFormat(metadata);
+    if(!(geometry instanceof ArrayBuffer)||geometry.byteLength!==sizes.geometryBytes||
+       !(sh instanceof ArrayBuffer)||sh.byteLength!==sizes.shBytes) throw new Error('Model buffer sizes do not match the manifest.');
+    const gl=this.gl,count=metadata.gaussian_count,values=new Float32Array(geometry);
+    const positions=new Float32Array(count*3);
+    for(let i=0;i<count;i++) {
+      for(let j=0;j<10;j++) if(!Number.isFinite(values[12*i+j])) throw new Error('Geometry contains a non-finite value.');
+      positions.set(values.subarray(12*i,12*i+3),3*i);
     }
-    if (file?.byte_order !== undefined && file.byte_order !== "little-endian") {
-        throw new Error("SH coefficients must use little-endian byte order.");
+    const next={metadata,count,format};
+    let worker;
+    try {
+      next.geometry=this._dataTexture(values,count*3);
+      next.sh=this._dataTexture(format.packed?new Uint16Array(sh):new Float32Array(sh),count*12,format.packed);
+      next.indexBuffer=gl.createBuffer();
+      gl.bindBuffer(gl.ARRAY_BUFFER,next.indexBuffer);
+      gl.bufferData(gl.ARRAY_BUFFER,count*4,gl.DYNAMIC_DRAW);
+      next.vao=gl.createVertexArray(); gl.bindVertexArray(next.vao);
+      gl.bindBuffer(gl.ARRAY_BUFFER,next.indexBuffer);
+      gl.enableVertexAttribArray(0); gl.vertexAttribIPointer(0,1,gl.UNSIGNED_INT,0,0); gl.vertexAttribDivisor(0,1);
+      gl.bindVertexArray(null);
+      this._checkError('model upload');
+      worker=new Worker(new URL('./sort-worker.js',import.meta.url),{type:'module'});
+      const generation=this.generation+1;
+      worker.onmessage=event=>this._sortMessage(event.data);
+      worker.onerror=event=>{
+        if(this.worker!==worker) return;
+        this.sortFailure=new Error(event.message||'Depth sorting worker failed.');
+        this._rejectSort(this.sortFailure);
+      };
+      worker.postMessage({type:'init',generation,positions:positions.buffer},[positions.buffer]);
+      this._assertAlive();
+      this._rejectSort(abortError()); this.worker?.terminate();
+      this._destroyModel(this.model); this.model=next; this.worker=worker; this.generation=generation;
+      this.sortedPosition=null; this.lastSortMs=0; this.sortFailure=null;
+      this._destroyTarget(this.previewTarget); this.previewTarget=null;
+    } catch(error) { worker?.terminate(); this._destroyModel(next); throw error; }
+  }
+  setCamera(camera) { this._assertAlive(); this.camera=copyCamera(camera); }
+  _rejectSort(error) { if(this.sortPending) { this.sortPending.reject(error); this.sortPending=null; } }
+  _sortMessage(data) {
+    const pending=this.sortPending;
+    if(!pending||data.generation!==this.generation||data.requestId!==pending.requestId) return;
+    this.sortPending=null;
+    if(this.disposed||this.closing) { pending.reject(abortError()); return; }
+    if(data.type==='error') { pending.reject(new Error(data.message)); return; }
+    if(data.type!=='sorted'||data.order.byteLength!==this.model.count*4) { pending.reject(new Error('Invalid sort worker response.')); return; }
+    const gl=this.gl;
+    gl.bindBuffer(gl.ARRAY_BUFFER,this.model.indexBuffer);
+    gl.bufferSubData(gl.ARRAY_BUFFER,0,new Uint32Array(data.order));
+    this.sortedPosition=pending.position;
+    this.lastSortMs=data.sortMs;
+    pending.resolve(data.sortMs);
+  }
+  async _sort(position) {
+    if(this.sortFailure) throw this.sortFailure;
+    const p=position.map(Math.fround);
+    if(this.sortedPosition?.every((value,i)=>value===p[i])) return 0;
+    if(this.sortPending) throw new Error('Another depth sort is already pending.');
+    const requestId=++this.requestId;
+    return new Promise((resolve,reject)=>{
+      this.sortPending={requestId,position:p,resolve,reject};
+      this.worker.postMessage({type:'sort',generation:this.generation,requestId,position:p});
+    });
+  }
+  _attachment(width,height,internalFormat,type) {
+    const gl=this.gl,texture=gl.createTexture(),fbo=gl.createFramebuffer();
+    gl.bindTexture(gl.TEXTURE_2D,texture);
+    gl.texParameteri(gl.TEXTURE_2D,gl.TEXTURE_MIN_FILTER,gl.NEAREST);
+    gl.texParameteri(gl.TEXTURE_2D,gl.TEXTURE_MAG_FILTER,gl.NEAREST);
+    gl.texParameteri(gl.TEXTURE_2D,gl.TEXTURE_WRAP_S,gl.CLAMP_TO_EDGE);
+    gl.texParameteri(gl.TEXTURE_2D,gl.TEXTURE_WRAP_T,gl.CLAMP_TO_EDGE);
+    gl.texImage2D(gl.TEXTURE_2D,0,internalFormat,width,height,0,gl.RGBA,type,null);
+    gl.bindFramebuffer(gl.FRAMEBUFFER,fbo);
+    gl.framebufferTexture2D(gl.FRAMEBUFFER,gl.COLOR_ATTACHMENT0,gl.TEXTURE_2D,texture,0);
+    if(gl.checkFramebufferStatus(gl.FRAMEBUFFER)!==gl.FRAMEBUFFER_COMPLETE) {
+      gl.deleteFramebuffer(fbo); gl.deleteTexture(texture);
+      throw new Error('This device cannot allocate the requested render target.');
     }
-    const dtype = file?.dtype === undefined ? "float32" : file.dtype;
-    if (dtype !== "float32" && dtype !== "float16") throw new Error(`Unsupported SH storage type: ${String(dtype)}.`);
-    const packed = dtype === "float16";
-    const stride = packed ? 96 : 192;
-    if (file?.stride !== undefined && file.stride !== stride) {
-        throw new Error(`SH stride ${String(file.stride)} does not match ${dtype} (${stride} bytes per Gaussian).`);
+    return {texture,fbo};
+  }
+  _target(width,height,previous) {
+    if(!Number.isInteger(width)||!Number.isInteger(height)||width<1||height<1||
+      width>this.limits.maxTextureSize||height>this.limits.maxTextureSize) throw new Error('Invalid render dimensions.');
+    if(previous?.width===width&&previous?.height===height) return previous;
+    const gl=this.gl,next={width,height};
+    try {
+      next.accum=this._attachment(width,height,this.accumulation==='float32'?gl.RGBA32F:this.accumulation==='float16'?gl.RGBA16F:gl.RGBA8,
+        this.accumulation==='float32'?gl.FLOAT:this.accumulation==='float16'?gl.HALF_FLOAT:gl.UNSIGNED_BYTE);
+      next.resolved=this._attachment(width,height,gl.RGBA8,gl.UNSIGNED_BYTE);
+      this._checkError('render target allocation');
+    } catch(error) { this._destroyTarget(next); throw error; }
+    this._destroyTarget(previous); return next;
+  }
+  _draw(target,camera,projection,present) {
+    const gl=this.gl,{width,height}=target,r=this.model.metadata.render||{},u=this.ewa.uniforms;
+    gl.bindFramebuffer(gl.FRAMEBUFFER,target.accum.fbo);
+    gl.viewport(0,0,width,height); gl.clearColor(0,0,0,0); gl.clear(gl.COLOR_BUFFER_BIT);
+    gl.enable(gl.BLEND); gl.blendEquation(gl.FUNC_ADD); gl.blendFuncSeparate(gl.ONE_MINUS_DST_ALPHA,gl.ONE,gl.ONE_MINUS_DST_ALPHA,gl.ONE);
+    gl.useProgram(this.ewa.program); gl.bindVertexArray(this.model.vao);
+    gl.activeTexture(gl.TEXTURE0); gl.bindTexture(gl.TEXTURE_2D,this.model.geometry.texture);
+    gl.activeTexture(gl.TEXTURE1); gl.bindTexture(gl.TEXTURE_2D,this.model.sh.texture);
+    gl.uniform1i(u.u_geometry,0); gl.uniform1i(u.u_sh,1);
+    gl.uniform1i(u.u_geometryWidth,this.model.geometry.width); gl.uniform1i(u.u_shWidth,this.model.sh.width);
+    for(const name of ['position','right','down','forward']) gl.uniform3fv(u[`u_${name}`],camera[name]);
+    const fy=projection?Math.min(width,height)/Math.PI:height/(2*camera.tanHalfFovY);
+    gl.uniform2f(u.u_size,width,height); gl.uniform2f(u.u_focal,fy,fy);
+    gl.uniform2f(u.u_principal,width/2,height/2); gl.uniform2f(u.u_tanFov,width/(2*fy),height/(2*fy));
+    gl.uniform1f(u.u_near,r.near_plane??.01); gl.uniform1f(u.u_lowPass,r.low_pass_variance??.3);
+    gl.uniform1f(u.u_minAlpha,r.min_alpha??1/255); gl.uniform1f(u.u_maxAlpha,r.max_alpha??.99);
+    gl.uniform1i(u.u_projection,projection); gl.uniform1i(u.u_degree,r.sh_degree??3);
+    gl.uniform1i(u.u_antialias,Boolean(r.antialiasing));
+    gl.drawArraysInstanced(gl.TRIANGLE_STRIP,0,4,this.model.count);
+    gl.disable(gl.BLEND); gl.bindVertexArray(this.emptyVao);
+    gl.bindFramebuffer(gl.FRAMEBUFFER,target.resolved.fbo);
+    gl.useProgram(this.resolve.program);
+    const v=this.resolve.uniforms;
+    gl.activeTexture(gl.TEXTURE0); gl.bindTexture(gl.TEXTURE_2D,target.accum.texture);
+    gl.uniform1i(v.u_image,0); gl.uniform3fv(v.u_background,r.background??[0,0,0]);
+    gl.uniform2f(v.u_size,width,height); gl.uniform1i(v.u_projection,projection);
+    gl.drawArrays(gl.TRIANGLES,0,3);
+    if(present) {
+      gl.bindFramebuffer(gl.READ_FRAMEBUFFER,target.resolved.fbo);
+      gl.bindFramebuffer(gl.DRAW_FRAMEBUFFER,null);
+      gl.blitFramebuffer(0,0,width,height,0,0,width,height,gl.COLOR_BUFFER_BIT,gl.NEAREST);
     }
-    return {dtype, stride, packed};
-}
-
-async function checkedShader(device, code, label) {
-    const module = device.createShaderModule({code, label});
-    const info = await module.getCompilationInfo();
-    const errors = info.messages.filter(message => message.type === "error");
-    if (errors.length) throw new Error(`${label}: ${errors.map(m => `${m.lineNum}:${m.linePos} ${m.message}`).join("\n")}`);
-    return module;
-}
-
-export class WebGpuRayRenderer {
-    static async create(canvas) {
-        if (!globalThis.isSecureContext || !navigator.gpu) {
-            throw new Error("WebGPU is unavailable. Use an up-to-date WebGPU browser with GPU acceleration, over HTTPS or localhost.");
-        }
-        let adapter = null;
-        // Some browsers report a transient null while their GPU process is
-        // starting. Keep retries short, bounded and visible as initialization.
-        for (let attempt = 0; attempt < 3 && !adapter; attempt++) {
-            if (attempt) await new Promise(resolve => setTimeout(resolve, attempt * 250));
-            adapter = await navigator.gpu.requestAdapter({powerPreference: "high-performance"});
-        }
-        if (!adapter) throw new Error("No WebGPU adapter is available. Check browser GPU acceleration and graphics drivers.");
-        // Ask for the adapter's storage-buffer limits; browser defaults are
-        // often smaller than the hardware supports. Actual allocations still
-        // follow the exported model sizes and are checked before uploading.
-        const device = await adapter.requestDevice({
-            label: "3DGRT WebGPU viewer",
-            requiredFeatures: adapter.features.has("timestamp-query") ? ["timestamp-query"] : [],
-            requiredLimits: {
-                maxStorageBufferBindingSize: adapter.limits.maxStorageBufferBindingSize,
-                maxBufferSize: adapter.limits.maxBufferSize,
-            },
-        });
-        const renderer = new WebGpuRayRenderer(canvas, adapter, device);
-        try {
-            await renderer.initialize();
-            return renderer;
-        } catch (error) {
-            renderer.dispose();
-            throw error;
-        }
+    gl.bindFramebuffer(gl.FRAMEBUFFER,null); gl.bindVertexArray(null);
+    this._checkError('render');
+  }
+  _fence() {
+    const gl=this.gl,sync=gl.fenceSync(gl.SYNC_GPU_COMMANDS_COMPLETE,0);
+    if(!sync) return Promise.reject(new Error('Could not create a WebGL completion fence.'));
+    gl.flush();
+    return new Promise((resolve,reject)=>{
+      const wait={sync,timer:null,reject};
+      this._syncWaits.add(wait);
+      const finish=(error)=>{
+        if(!this._syncWaits.delete(wait)) return;
+        clearTimeout(wait.timer); gl.deleteSync(sync);
+        error?reject(error):resolve();
+      };
+      wait.cancel=()=>finish(abortError());
+      const poll=()=>{
+        if(this.disposed) { finish(abortError()); return; }
+        const status=gl.clientWaitSync(sync,0,0);
+        if(status===gl.WAIT_FAILED) finish(new Error('WebGL completion fence failed.'));
+        else if(status===gl.ALREADY_SIGNALED||status===gl.CONDITION_SATISFIED) finish();
+        else wait.timer=setTimeout(poll,1);
+      };
+      poll();
+    });
+  }
+  async _frame({width,height,camera,previewCanvas=null,measureGpu=true}) {
+    this._assertAlive();
+    if(!this.model) throw new Error('Load a model before rendering.');
+    if(this.rendering) throw new Error('Only one WebGL frame may be in flight.');
+    this.rendering=true;
+    const start=performance.now();
+    let query=null;
+    try {
+      const sortMs=await this._sort(camera.position);
+      this._assertAlive();
+      let target;
+      if(previewCanvas) {
+        this.previewTarget=this._target(width,height,this.previewTarget); target=this.previewTarget;
+      } else {
+        this.target=this._target(width,height,this.target); target=this.target;
+        if(this.canvas.width!==width||this.canvas.height!==height) { this.canvas.width=width; this.canvas.height=height; }
+        this.width=width; this.height=height;
+      }
+      const gl=this.gl;
+      if(this.timer&&measureGpu) { query=gl.createQuery(); this._queries.add(query); gl.beginQuery(this.timer.TIME_ELAPSED_EXT,query); }
+      try { this._draw(target,camera,previewCanvas?1:0,!previewCanvas); }
+      finally { if(query) gl.endQuery(this.timer.TIME_ELAPSED_EXT); }
+      await this._fence();
+      this._assertAlive();
+      let gpuMs=null;
+      if(query&&gl.getQueryParameter(query,gl.QUERY_RESULT_AVAILABLE)&&!gl.getParameter(this.timer.GPU_DISJOINT_EXT)) gpuMs=gl.getQueryParameter(query,gl.QUERY_RESULT)/1e6;
+      if(previewCanvas) {
+        const {rgba}=this._readTarget(target);
+        const context=previewCanvas.getContext('2d',{alpha:false});
+        if(!context) throw new Error('The preview canvas requires a 2D context.');
+        if(previewCanvas.width!==width||previewCanvas.height!==height) { previewCanvas.width=width; previewCanvas.height=height; }
+        context.putImageData(new ImageData(new Uint8ClampedArray(rgba.buffer),width,height),0,0);
+      }
+      return {renderMs:performance.now()-start,sortMs,gpuMs,mode:'webgl2-ewa',accumulation:this.accumulation};
+    } finally {
+      if(query&&this._queries.delete(query)) this.gl.deleteQuery(query);
+      this.rendering=false;
     }
-
-    constructor(canvas, adapter, device) {
-        this.canvas = canvas;
-        this.device = device;
-        this.adapterInfo = adapter.info ?? {};
-        this.context = canvas.getContext("webgpu");
-        this.format = navigator.gpu.getPreferredCanvasFormat();
-        this.modelBuffers = [];
-        this.uniformData = new ArrayBuffer(128);
-        this.uniformFloats = new Float32Array(this.uniformData);
-        this.uniformUints = new Uint32Array(this.uniformData);
-        this.width = 0;
-        this.height = 0;
-        this.model = null;
-        this.shFormat = null;
-        this.modelRevision = 0;
-        this.previewTarget = null;
-        this.camera = null;
-        this.disposed = false;
-        this.closing = false;
-        this.shutdownPromise = null;
-        this.rendering = false;
-        this.lostReason = null;
-        this.frameCount = 0;
-        this.lastGpuMs = null;
-        this.lastTileStats = null;
-        this.lastMode = null;
-        device.lost.then(info => { this.lostReason = info.message || "The graphics device was lost."; });
-    }
-
-    async initialize() {
-        if (!this.context) throw new Error("Unable to create a WebGPU canvas context.");
-        const response = await fetch(new URL("./trace.wgsl", import.meta.url));
-        if (!response.ok) throw new Error(`Cannot load trace.wgsl: HTTP ${response.status}.`);
-        const traceSource = await response.text();
-        const tiledResponse = await fetch(new URL("./tiled.wgsl", import.meta.url));
-        if (!tiledResponse.ok) throw new Error(`Cannot load tiled.wgsl: HTTP ${tiledResponse.status}.`);
-        const tiledSource = traceSource.slice(0, traceSource.indexOf("@compute @workgroup_size")) + await tiledResponse.text();
-        const traceModule = await checkedShader(this.device, traceSource, "3DGRT trace.wgsl");
-        const tiledModule = await checkedShader(this.device, tiledSource, "3DGRT tiled.wgsl");
-        const presentModule = await checkedShader(this.device, PRESENT_SHADER, "3DGRT present");
-        this.computePipeline = await this.device.createComputePipelineAsync({
-            label: "3DGRT quartic reference tracing", layout: "auto",
-            compute: {module: traceModule, entryPoint: "trace"},
-        });
-        this.tiledPipeline = await this.device.createComputePipelineAsync({
-            label: "3DGRT tiled reference tracing", layout: "auto",
-            compute: {module: tiledModule, entryPoint: "traceTiled"},
-        });
-        this.projectPipeline = await this.device.createComputePipelineAsync({
-            label: "3DGRT conservative support projection", layout: "auto",
-            compute: {module: tiledModule, entryPoint: "project"},
-        });
-        this.presentPipeline = await this.device.createRenderPipelineAsync({
-            label: "3DGRT present without additional gamma", layout: "auto",
-            vertex: {module: presentModule, entryPoint: "vertexMain"},
-            fragment: {module: presentModule, entryPoint: "fragmentMain", targets: [{format: this.format}]},
-            primitive: {topology: "triangle-list"},
-        });
-        this.uniformBuffer = this.device.createBuffer({
-            label: "3DGRT camera", size: this.uniformData.byteLength,
-            usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST,
-        });
-        this.tileStatsBuffer = this.device.createBuffer({size: 32, usage: GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_SRC | GPUBufferUsage.COPY_DST});
-        this.tileStatsReadback = this.device.createBuffer({size: 32, usage: GPUBufferUsage.COPY_DST | GPUBufferUsage.MAP_READ});
-        if (this.device.features.has("timestamp-query")) {
-            this.timestampQuery = this.device.createQuerySet({label: "3DGRT compute timing", type: "timestamp", count: 2});
-            this.timestampResolve = this.device.createBuffer({size: 16, usage: GPUBufferUsage.QUERY_RESOLVE | GPUBufferUsage.COPY_SRC});
-            this.timestampReadback = this.device.createBuffer({size: 16, usage: GPUBufferUsage.COPY_DST | GPUBufferUsage.MAP_READ});
-        }
-        this.context.configure({device: this.device, format: this.format, alphaMode: "opaque", colorSpace: "srgb"});
-    }
-
-    assertAvailable() {
-        if (this.disposed) throw new Error("Renderer has been disposed.");
-        if (this.closing) throw new DOMException("Renderer is shutting down.", "AbortError");
-        if (this.lostReason) throw new Error(`WebGPU device lost: ${this.lostReason} Reload the page to reconnect.`);
-    }
-
-    async loadModel({geometry, sh, bvh, metadata}) {
-        this.assertAvailable();
-        if (this.rendering) throw new Error("Wait for the current render before loading a model.");
-        const count = exactInteger(metadata.gaussian_count, "gaussian_count");
-        const nodeCount = exactInteger(metadata.bvh_node_count, "bvh_node_count");
-        const depth = exactInteger(metadata.bvh_max_depth, "bvh_max_depth", 0);
-        if (depth > 62) throw new Error("This BVH exceeds the supported traversal depth (62). Re-export it using the bundled exporter.");
-        const render = metadata.render;
-        if (!render || render.kernel_degree !== 4 || render.primitive_type !== "instances" || render.pipeline !== "reference") {
-            throw new Error("This renderer requires a reference/instances model with kernel degree 4. Re-export a supported checkpoint.");
-        }
-        exactInteger(render.sh_degree, "render.sh_degree", 0);
-        if (render.sh_degree > 3) throw new Error("Only SH degrees 0 through 3 are supported.");
-        for (const name of ["min_response", "min_alpha", "min_transmittance"]) {
-            if (!Number.isFinite(render[name]) || render[name] < 0 || render[name] >= 1) {
-                throw new Error(`render.${name} must be in [0, 1).`);
-            }
-        }
-        if (render.max_alpha !== undefined && render.max_alpha !== 0.99) throw new Error("The native maximum alpha must be 0.99.");
-        const background = finiteVector(render.background, 3, "render.background");
-        const shFormat = shStorageFormat(metadata);
-        const arrays = [bytesOf(geometry, "geometry"), bytesOf(sh, "sh"), bytesOf(bvh, "bvh")];
-        const sizes = [count * 64, count * shFormat.stride, nodeCount * 32];
-        const labels = ["Gaussian geometry", "SH coefficients", "BVH"];
-        const limit = Math.min(this.device.limits.maxStorageBufferBindingSize, this.device.limits.maxBufferSize);
-        for (let i = 0; i < arrays.length; i++) {
-            if (arrays[i].byteLength !== sizes[i]) throw new Error(`${labels[i]} size is ${arrays[i].byteLength}; expected ${sizes[i]} bytes.`);
-            if (sizes[i] > limit) {
-                throw new Error(`${labels[i]} needs ${(sizes[i] / 1048576).toFixed(1)} MiB, but this browser/GPU allows ${(limit / 1048576).toFixed(1)} MiB per storage buffer. File splitting only solves download limits; use a device with larger WebGPU buffer limits.`);
-            }
-        }
-        const nextBuffers = [];
-        let nextProjected;
-        this.device.pushErrorScope("out-of-memory");
-        this.device.pushErrorScope("validation");
-        let uploadError;
-        try {
-            for (let i = 0; i < arrays.length; i++) {
-                const buffer = this.device.createBuffer({label: labels[i], size: sizes[i], usage: GPUBufferUsage.STORAGE, mappedAtCreation: true});
-                nextBuffers.push(buffer);
-                new Uint8Array(buffer.getMappedRange()).set(arrays[i]);
-                buffer.unmap();
-            }
-            nextProjected = this.device.createBuffer({label: "Conservative projected support", size: count * 16, usage: GPUBufferUsage.STORAGE});
-        } catch (error) {
-            uploadError = error;
-        }
-        const validationError = await this.device.popErrorScope();
-        const memoryError = await this.device.popErrorScope();
-        if (uploadError || validationError || memoryError || this.disposed || this.lostReason) {
-            nextBuffers.forEach(buffer => buffer.destroy());
-            nextProjected?.destroy();
-            this.assertAvailable();
-            throw new Error(`Model GPU upload failed: ${(uploadError || validationError || memoryError).message}`);
-        }
-        try {
-            await this.device.queue.onSubmittedWorkDone();
-            this.assertAvailable();
-        } catch (error) {
-            nextBuffers.forEach(buffer => buffer.destroy());
-            nextProjected?.destroy();
-            throw error;
-        }
-        this.modelBuffers.forEach(buffer => buffer.destroy());
-        this.projectedBuffer?.destroy();
-        this.modelBuffers = nextBuffers;
-        this.projectedBuffer = nextProjected;
-        this.model = {...metadata, render: {...render, background}};
-        this.shFormat = shFormat;
-        this.modelRevision++;
-        this.lastGpuMs = null;
-        this.lastTileStats = null;
-        this.frameCount = 0;
-        this.updateBindGroups();
-    }
-
-    setCamera({position, right, down, forward, tanHalfFovY}) {
-        this.assertAvailable();
-        if (!Number.isFinite(tanHalfFovY) || tanHalfFovY <= 0) throw new Error("tanHalfFovY must be positive and finite.");
-        this.camera = {
-            position: finiteVector(position, 3, "camera.position"),
-            right: finiteVector(right, 3, "camera.right"),
-            down: finiteVector(down, 3, "camera.down"),
-            forward: finiteVector(forward, 3, "camera.forward"),
-            tanHalfFovY,
-        };
-    }
-
-    updateBindGroups() {
-        if (!this.outputTexture || this.modelBuffers.length !== 3) return;
-        this.computeBindGroup = this.device.createBindGroup({
-            layout: this.computePipeline.getBindGroupLayout(0),
-            entries: [
-                {binding: 0, resource: {buffer: this.uniformBuffer}},
-                ...this.modelBuffers.map((buffer, i) => ({binding: i + 1, resource: {buffer}})),
-                {binding: 4, resource: this.outputTexture.createView()},
-            ],
-        });
-        this.tiledBindGroup = this.device.createBindGroup({
-            layout: this.tiledPipeline.getBindGroupLayout(0),
-            entries: [
-                {binding: 0, resource: {buffer: this.uniformBuffer}},
-                ...this.modelBuffers.map((buffer, i) => ({binding: i + 1, resource: {buffer}})),
-                {binding: 4, resource: this.outputTexture.createView()},
-                {binding: 5, resource: {buffer: this.tileStatsBuffer}},
-                {binding: 6, resource: {buffer: this.projectedBuffer}},
-            ],
-        });
-        this.projectBindGroup = this.device.createBindGroup({
-            layout: this.projectPipeline.getBindGroupLayout(0),
-            entries: [
-                {binding: 0, resource: {buffer: this.uniformBuffer}},
-                {binding: 1, resource: {buffer: this.modelBuffers[0]}},
-                {binding: 6, resource: {buffer: this.projectedBuffer}},
-            ],
-        });
-        this.presentBindGroup = this.device.createBindGroup({
-            layout: this.presentPipeline.getBindGroupLayout(0),
-            entries: [{binding: 0, resource: this.outputTexture.createView()}],
-        });
-    }
-
-    resize(width, height) {
-        exactInteger(width, "width");
-        exactInteger(height, "height");
-        const limit = this.device.limits.maxTextureDimension2D;
-        if (width > limit || height > limit) throw new Error(`Render dimensions exceed this GPU's ${limit}px texture limit.`);
-        if (width === this.width && height === this.height) return;
-        this.outputTexture?.destroy();
-        this.width = width;
-        this.height = height;
-        this.lastGpuMs = null;
-        this.lastTileStats = null;
-        this.frameCount = 0;
-        this.canvas.width = width;
-        this.canvas.height = height;
-        this.outputTexture = this.device.createTexture({
-            label: "3DGRT display image", size: [width, height], format: "rgba8unorm",
-            usage: GPUTextureUsage.STORAGE_BINDING | GPUTextureUsage.TEXTURE_BINDING | GPUTextureUsage.COPY_SRC,
-        });
-        this.updateBindGroups();
-    }
-
-    async render({width, height, measureGpu, mode = "tiled", tileCapacity = 2048}) {
-        this.assertAvailable();
-        if (!this.model || !this.camera) throw new Error("Load a model and set a camera before rendering.");
-        if (this.rendering) throw new Error("A frame is already rendering. Await render() before scheduling another.");
-        if (mode !== "tiled" && mode !== "bvh") throw new Error("Rendering mode must be tiled or bvh.");
-        exactInteger(tileCapacity, "tileCapacity");
-        if (tileCapacity > 2048) throw new Error("tileCapacity must not exceed 2048.");
-        this.rendering = true;
-        const start = performance.now();
-        // Sample GPU time once per 30 completed frames by default. Reading a
-        // query requires a small extra map; it is included in renderMs, and
-        // callers doing benchmarks may explicitly request every frame.
-        let queryGpu = false;
-        let sampleStats = false;
-        let stripCount = 0;
-        let gpuMilliseconds = 0;
-        this.device.pushErrorScope("validation");
-        try {
-            this.resize(width, height);
-            if (mode !== this.lastMode) {
-                this.lastGpuMs = null;
-                this.lastTileStats = null;
-                this.frameCount = 0;
-                this.lastMode = mode;
-            }
-            sampleStats = measureGpu ?? (this.frameCount % 30 === 0);
-            queryGpu = Boolean(this.timestampQuery && sampleStats);
-            const camera = this.camera;
-            const render = this.model.render;
-            this.uniformFloats.fill(0);
-            this.uniformFloats.set([...camera.position, camera.tanHalfFovY], 0);
-            this.uniformFloats.set(camera.right, 4);
-            this.uniformFloats.set(camera.down, 8);
-            this.uniformFloats.set(camera.forward, 12);
-            this.uniformUints.set([width, height, render.sh_degree, this.model.bvh_node_count], 16);
-            this.uniformFloats.set([render.min_response, render.min_alpha, render.min_transmittance, this.shFormat.packed ? 1 : 0], 20);
-            this.uniformFloats.set(render.background, 24);
-            // Each submission covers at most about 128K pixels. Submit/await
-            // strips sequentially so navigation/disposal can stop between
-            // them. This bounds queued work, not worst-case ray complexity.
-            const stripRows = Math.max(8, Math.floor(Math.min(height, 131072 / width) / 8) * 8);
-            for (let row = 0; row < height; row += stripRows) {
-                this.assertAvailable();
-                const rows = Math.min(stripRows, height - row);
-                const last = row + rows === height;
-                this.uniformUints.set([row, this.model.gaussian_count, tileCapacity, 0], 28);
-                this.device.queue.writeBuffer(this.uniformBuffer, 0, this.uniformData);
-                const encoder = this.device.createCommandEncoder({label: `3DGRT ${mode} strip ${stripCount}`});
-                if (row === 0 && mode === "tiled") encoder.clearBuffer(this.tileStatsBuffer);
-                const computeDescriptor = {label: `${mode} projection and ray tracing`};
-                if (queryGpu) computeDescriptor.timestampWrites = {
-                    querySet: this.timestampQuery, beginningOfPassWriteIndex: 0, endOfPassWriteIndex: 1,
-                };
-                const compute = encoder.beginComputePass(computeDescriptor);
-                if (row === 0 && mode === "tiled") {
-                    compute.setPipeline(this.projectPipeline);
-                    compute.setBindGroup(0, this.projectBindGroup);
-                    compute.dispatchWorkgroups(Math.ceil(this.model.gaussian_count / 64));
-                }
-                compute.setPipeline(mode === "tiled" ? this.tiledPipeline : this.computePipeline);
-                compute.setBindGroup(0, mode === "tiled" ? this.tiledBindGroup : this.computeBindGroup);
-                compute.dispatchWorkgroups(Math.ceil(width / 8), Math.ceil(rows / 8));
-                compute.end();
-                if (queryGpu) {
-                    encoder.resolveQuerySet(this.timestampQuery, 0, 2, this.timestampResolve, 0);
-                    encoder.copyBufferToBuffer(this.timestampResolve, 0, this.timestampReadback, 0, 16);
-                }
-                if (last && sampleStats && mode === "tiled") encoder.copyBufferToBuffer(this.tileStatsBuffer, 0, this.tileStatsReadback, 0, 32);
-                if (last) {
-                    const present = encoder.beginRenderPass({
-                        label: "Present completed frame",
-                        colorAttachments: [{view: this.context.getCurrentTexture().createView(), loadOp: "clear", storeOp: "store", clearValue: [0, 0, 0, 1]}],
-                    });
-                    present.setPipeline(this.presentPipeline);
-                    present.setBindGroup(0, this.presentBindGroup);
-                    present.draw(3);
-                    present.end();
-                }
-                this.device.queue.submit([encoder.finish()]);
-                await this.device.queue.onSubmittedWorkDone();
-                this.assertAvailable();
-                if (queryGpu) {
-                    await this.timestampReadback.mapAsync(GPUMapMode.READ);
-                    try {
-                        const stamps = new BigUint64Array(this.timestampReadback.getMappedRange());
-                        gpuMilliseconds += Number(stamps[1] - stamps[0]) / 1e6;
-                    } finally {
-                        this.timestampReadback.unmap();
-                    }
-                }
-                stripCount++;
-            }
-            if (queryGpu) this.lastGpuMs = gpuMilliseconds;
-            if (sampleStats && mode === "tiled") {
-                await this.tileStatsReadback.mapAsync(GPUMapMode.READ);
-                try {
-                    const values = new Uint32Array(this.tileStatsReadback.getMappedRange());
-                    this.lastTileStats = {tileCount: values[0], overflowTileCount: values[1], fallbackTileCount: values[1],
-                        fallbackTiles: values[1], candidateCountSum: values[2], maxCandidates: values[3], tiePixelCount: values[4], tileCapacity};
-                } finally {
-                    this.tileStatsReadback.unmap();
-                }
-            }
-        } finally {
-            this.rendering = false;
-            const error = await this.device.popErrorScope();
-            if (error) throw new Error(`WebGPU frame failed: ${error.message}`);
-        }
-        this.assertAvailable();
-        this.frameCount++;
-        return {renderMs: performance.now() - start, width, height, gpuMs: this.lastGpuMs, gpuMeasuredThisFrame: queryGpu,
-            mode, stripCount, tileStats: mode === "tiled" ? this.lastTileStats : null};
-    }
-
-    ensurePreviewTarget(canvas, width, height) {
-        exactInteger(width, "preview width");
-        exactInteger(height, "preview height");
-        const limit = this.device.limits.maxTextureDimension2D;
-        if (width > limit || height > limit) throw new Error(`Preview dimensions exceed this GPU's ${limit}px texture limit.`);
-        if (canvas === this.canvas) throw new Error("The preview needs a separate canvas.");
-        if (this.previewTarget && this.previewTarget.canvas !== canvas) this.destroyPreviewTarget();
-        if (!this.previewTarget) {
-            const context = canvas.getContext("webgpu");
-            if (!context) throw new Error("Unable to create the WebGPU preview canvas context.");
-            context.configure({device: this.device, format: this.format, alphaMode: "opaque", colorSpace: "srgb"});
-            this.previewTarget = {
-                canvas, context, width: 0, height: 0, boundRevision: -1, renderedRevision: -1,
-                uniformData: new ArrayBuffer(128),
-                uniformBuffer: this.device.createBuffer({
-                    label: "3DGRT preview camera", size: 128,
-                    usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST,
-                }),
-            };
-        }
-        const target = this.previewTarget;
-        if (target.width !== width || target.height !== height) {
-            target.texture?.destroy();
-            target.width = canvas.width = width;
-            target.height = canvas.height = height;
-            target.texture = this.device.createTexture({
-                label: "3DGRT fisheye preview image", size: [width, height], format: "rgba8unorm",
-                usage: GPUTextureUsage.STORAGE_BINDING | GPUTextureUsage.TEXTURE_BINDING | GPUTextureUsage.COPY_SRC,
-            });
-            target.boundRevision = -1;
-            target.renderedRevision = -1;
-        }
-        if (target.boundRevision !== this.modelRevision) {
-            target.computeBindGroup = this.device.createBindGroup({
-                layout: this.computePipeline.getBindGroupLayout(0),
-                entries: [
-                    {binding: 0, resource: {buffer: target.uniformBuffer}},
-                    ...this.modelBuffers.map((buffer, i) => ({binding: i + 1, resource: {buffer}})),
-                    {binding: 4, resource: target.texture.createView()},
-                ],
-            });
-            target.presentBindGroup = this.device.createBindGroup({
-                layout: this.presentPipeline.getBindGroupLayout(0),
-                entries: [{binding: 0, resource: target.texture.createView()}],
-            });
-            target.boundRevision = this.modelRevision;
-        }
-        return target;
-    }
-
-    async renderPreview(canvas, {width = 192, height = 192, camera = this.camera, measureGpu = false} = {}) {
-        this.assertAvailable();
-        if (!this.model || !camera) throw new Error("Load a model and provide a camera before rendering a preview.");
-        if (this.rendering) throw new Error("Wait for the current render before rendering a preview.");
-        const pose = {
-            position: finiteVector(camera.position, 3, "preview camera.position"),
-            right: finiteVector(camera.right, 3, "preview camera.right"),
-            down: finiteVector(camera.down, 3, "preview camera.down"),
-            forward: finiteVector(camera.forward, 3, "preview camera.forward"),
-        };
-        this.rendering = true;
-        const started = performance.now();
-        const queryGpu = Boolean(measureGpu && this.timestampQuery);
-        let gpuMilliseconds = 0;
-        let stripCount = 0;
-        this.device.pushErrorScope("validation");
-        try {
-            const target = this.ensurePreviewTarget(canvas, width, height);
-            target.renderedRevision = -1;
-            const floats = new Float32Array(target.uniformData);
-            const uints = new Uint32Array(target.uniformData);
-            const settings = this.model.render;
-            floats.fill(0);
-            floats.set([...pose.position, 1], 0);
-            floats.set(pose.right, 4);
-            floats.set(pose.down, 8);
-            floats.set(pose.forward, 12);
-            uints.set([width, height, settings.sh_degree, this.model.bvh_node_count], 16);
-            floats.set([settings.min_response, settings.min_alpha, settings.min_transmittance, this.shFormat.packed ? 1 : 0], 20);
-            floats.set(settings.background, 24);
-            const stripRows = Math.max(8, Math.floor(Math.min(height, 131072 / width) / 8) * 8);
-            for (let row = 0; row < height; row += stripRows) {
-                this.assertAvailable();
-                const rows = Math.min(stripRows, height - row);
-                const last = row + rows === height;
-                // Perspective tile bounds are invalid for a 180-degree lens.
-                // The preview deliberately uses the exact BVH reference path.
-                uints.set([row, this.model.gaussian_count, 0, 1], 28);
-                this.device.queue.writeBuffer(target.uniformBuffer, 0, target.uniformData);
-                const encoder = this.device.createCommandEncoder({label: "3DGRT fisheye preview"});
-                const descriptor = {label: "180-degree equidistant BVH tracing"};
-                if (queryGpu) descriptor.timestampWrites = {
-                    querySet: this.timestampQuery, beginningOfPassWriteIndex: 0, endOfPassWriteIndex: 1,
-                };
-                const compute = encoder.beginComputePass(descriptor);
-                compute.setPipeline(this.computePipeline);
-                compute.setBindGroup(0, target.computeBindGroup);
-                compute.dispatchWorkgroups(Math.ceil(width / 8), Math.ceil(rows / 8));
-                compute.end();
-                if (queryGpu) {
-                    encoder.resolveQuerySet(this.timestampQuery, 0, 2, this.timestampResolve, 0);
-                    encoder.copyBufferToBuffer(this.timestampResolve, 0, this.timestampReadback, 0, 16);
-                }
-                if (last) {
-                    const present = encoder.beginRenderPass({
-                        label: "Present completed fisheye preview",
-                        colorAttachments: [{view: target.context.getCurrentTexture().createView(), loadOp: "clear", storeOp: "store", clearValue: [0, 0, 0, 1]}],
-                    });
-                    present.setPipeline(this.presentPipeline);
-                    present.setBindGroup(0, target.presentBindGroup);
-                    present.draw(3);
-                    present.end();
-                }
-                this.device.queue.submit([encoder.finish()]);
-                await this.device.queue.onSubmittedWorkDone();
-                this.assertAvailable();
-                if (queryGpu) {
-                    await this.timestampReadback.mapAsync(GPUMapMode.READ);
-                    try {
-                        const stamps = new BigUint64Array(this.timestampReadback.getMappedRange());
-                        gpuMilliseconds += Number(stamps[1] - stamps[0]) / 1e6;
-                    } finally {
-                        this.timestampReadback.unmap();
-                    }
-                }
-                stripCount++;
-            }
-            target.renderedRevision = this.modelRevision;
-        } finally {
-            this.rendering = false;
-            const error = await this.device.popErrorScope();
-            if (error) throw new Error(`WebGPU preview failed: ${error.message}`);
-        }
-        this.assertAvailable();
-        return {renderMs: performance.now() - started, gpuMs: queryGpu ? gpuMilliseconds : null,
-            width, height, stripCount, projection: "fisheye-equidistant", mode: "bvh"};
-    }
-
-    async readPixels() {
-        this.assertAvailable();
-        if (this.rendering) throw new Error("Wait for the current render before reading pixels.");
-        if (!this.outputTexture) throw new Error("Render a frame before reading pixels.");
-        return this.readTexturePixels(this.outputTexture, this.width, this.height);
-    }
-
-    async readPreviewPixels() {
-        this.assertAvailable();
-        if (this.rendering) throw new Error("Wait for the current render before reading preview pixels.");
-        const target = this.previewTarget;
-        if (!target || target.renderedRevision !== this.modelRevision) throw new Error("Render a preview for the current model before reading preview pixels.");
-        return this.readTexturePixels(target.texture, target.width, target.height);
-    }
-
-    async readTexturePixels(texture, width, height) {
-        const bytesPerRow = Math.ceil(width * 4 / 256) * 256;
-        const buffer = this.device.createBuffer({
-            label: "3DGRT validation readback", size: bytesPerRow * height,
-            usage: GPUBufferUsage.COPY_DST | GPUBufferUsage.MAP_READ,
-        });
-        try {
-            const encoder = this.device.createCommandEncoder();
-            encoder.copyTextureToBuffer({texture}, {buffer, bytesPerRow, rowsPerImage: height}, [width, height]);
-            this.device.queue.submit([encoder.finish()]);
-            await buffer.mapAsync(GPUMapMode.READ);
-            const source = new Uint8Array(buffer.getMappedRange());
-            const rgba = new Uint8Array(width * height * 4);
-            for (let y = 0; y < height; y++) rgba.set(source.subarray(y * bytesPerRow, y * bytesPerRow + width * 4), y * width * 4);
-            buffer.unmap();
-            return {width, height, rgba};
-        } finally {
-            buffer.destroy();
-        }
-    }
-
-    shutdown({timeoutMs = 8000} = {}) {
-        if (this.shutdownPromise) return this.shutdownPromise;
-        if (this.disposed) return Promise.resolve();
-        // Stop asynchronous render/upload continuations before placing a
-        // queue fence. A running strip may finish, but no next strip starts.
-        this.closing = true;
-        this.shutdownPromise = (async () => {
-            let timer;
-            try {
-                if (this.lostReason) throw new Error(this.lostReason);
-                await Promise.race([
-                    this.device.queue.onSubmittedWorkDone(),
-                    new Promise((_, reject) => {
-                        timer = setTimeout(() => reject(new Error("Timed out waiting for the GPU to finish.")), timeoutMs);
-                    }),
-                ]);
-                if (this.lostReason) throw new Error(this.lostReason);
-            } finally {
-                clearTimeout(timer);
-                this.dispose();
-            }
-        })();
-        return this.shutdownPromise;
-    }
-
-    destroyPreviewTarget() {
-        const target = this.previewTarget;
-        if (!target) return;
-        target.uniformBuffer.destroy();
-        target.texture?.destroy();
-        target.context.unconfigure();
-        this.previewTarget = null;
-    }
-
-    dispose() {
-        if (this.disposed) return;
-        this.disposed = true;
-        this.modelBuffers.forEach(buffer => buffer.destroy());
-        this.modelBuffers = [];
-        this.uniformBuffer?.destroy();
-        this.outputTexture?.destroy();
-        this.timestampQuery?.destroy();
-        this.timestampResolve?.destroy();
-        this.timestampReadback?.destroy();
-        this.projectedBuffer?.destroy();
-        this.tileStatsBuffer?.destroy();
-        this.tileStatsReadback?.destroy();
-        this.destroyPreviewTarget();
-        this.context?.unconfigure();
-        this.device.destroy();
-        this.model = null;
-        this.shFormat = null;
-        this.camera = null;
-        this.computeBindGroup = null;
-        this.presentBindGroup = null;
-        this.tiledBindGroup = null;
-        this.projectBindGroup = null;
-        this.outputTexture = null;
-        this.computePipeline = null;
-        this.tiledPipeline = null;
-        this.projectPipeline = null;
-        this.presentPipeline = null;
-    }
+  }
+  render({width,height,measureGpu=true}) {
+    this._assertAlive();
+    if(this.rendering) throw new Error('Only one WebGL frame may be in flight.');
+    const camera=copyCamera(this.camera);
+    const result=this._frame({width,height,camera,measureGpu});
+    this.pendingFrame=result; return result;
+  }
+  renderPreview(canvas,{width=192,height=192,camera,measureGpu=true}) {
+    this._assertAlive();
+    if(this.rendering) throw new Error('Only one WebGL frame may be in flight.');
+    const result=this._frame({width,height,camera:copyCamera(camera??this.camera),previewCanvas:canvas,measureGpu});
+    this.pendingFrame=result; return result;
+  }
+  _readTarget(target) {
+    if(!target) throw new Error('No frame has been rendered for this target.');
+    const gl=this.gl,{width,height}=target,raw=new Uint8Array(width*height*4),rgba=new Uint8Array(raw.length);
+    gl.bindFramebuffer(gl.FRAMEBUFFER,target.resolved.fbo);
+    gl.readPixels(0,0,width,height,gl.RGBA,gl.UNSIGNED_BYTE,raw);
+    gl.bindFramebuffer(gl.FRAMEBUFFER,null); this._checkError('frame readback');
+    const row=width*4;
+    for(let y=0;y<height;y++) rgba.set(raw.subarray((height-1-y)*row,(height-y)*row),y*row);
+    return {width,height,rgba};
+  }
+  async readPixels() { this._assertAlive(); if(this.rendering) throw new Error('Wait for rendering before reading pixels.'); return this._readTarget(this.target); }
+  async readPreviewPixels() { this._assertAlive(); if(this.rendering) throw new Error('Wait for rendering before reading pixels.'); return this._readTarget(this.previewTarget); }
+  _destroyModel(model) {
+    if(!model) return;
+    const gl=this.gl;
+    if(model.geometry) gl.deleteTexture(model.geometry.texture);
+    if(model.sh) gl.deleteTexture(model.sh.texture);
+    if(model.indexBuffer) gl.deleteBuffer(model.indexBuffer);
+    if(model.vao) gl.deleteVertexArray(model.vao);
+  }
+  _destroyTarget(target) {
+    if(!target) return;
+    for(const part of [target.accum,target.resolved]) if(part) { this.gl.deleteFramebuffer(part.fbo); this.gl.deleteTexture(part.texture); }
+  }
+  async shutdown({timeoutMs=8000}={}) {
+    if(this.disposed) return;
+    this.closing=true; this._rejectSort(abortError()); this.worker?.terminate();
+    let timer;
+    try {
+      await Promise.race([this.pendingFrame?.catch(error=>{if(error.name!=='AbortError') throw error;}),
+        new Promise((_,reject)=>{timer=setTimeout(()=>reject(new Error('GPU completion timed out.')),timeoutMs);})]);
+    } finally { clearTimeout(timer); this.dispose(); }
+  }
+  dispose(loseContext=true) {
+    if(this.disposed) return;
+    this.disposed=true; this.closing=true;
+    this.canvas.removeEventListener('webglcontextlost',this._lostHandler);
+    this._rejectSort(abortError()); this.worker?.terminate(); this.worker=null;
+    for(const wait of [...this._syncWaits]) wait.cancel();
+    for(const query of this._queries) this.gl.deleteQuery(query);
+    this._queries.clear();
+    this._destroyModel(this.model); this.model=null;
+    this._destroyTarget(this.target); this.target=null;
+    this._destroyTarget(this.previewTarget); this.previewTarget=null;
+    if(this.ewa) this.gl.deleteProgram(this.ewa.program);
+    if(this.resolve) this.gl.deleteProgram(this.resolve.program);
+    if(this.emptyVao) this.gl.deleteVertexArray(this.emptyVao);
+    this.camera=null; this.sortedPosition=null;
+    this._resolveLost({reason:'destroyed',message:'Renderer disposed.'});
+    if(loseContext&&!this.gl.isContextLost()) this.gl.getExtension('WEBGL_lose_context')?.loseContext();
+  }
 }

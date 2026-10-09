@@ -1,45 +1,36 @@
 #!/usr/bin/env python3
-"""Export a trusted local FullCircle .pt checkpoint for static WebGPU inference.
+"""Export a trusted local, radial-sorted 2D-EWA 3DGS checkpoint for WebGL2.
 
-Only CPU PyTorch, NumPy and OmegaConf are required; this module never imports
-the training model, CUDA extensions, OptiX, or a web server. Checkpoints use
-Python pickle and must be trusted local files. Exporting does not prune,
-downsample or modify the source checkpoint. SH defaults to float32 and can
-explicitly be quantized to float16; geometry and BVH retain their original bits.
+Only CPU PyTorch, NumPy and OmegaConf are needed. No CUDA/model import occurs.
+Every Gaussian is retained in checkpoint order. Geometry is FP32; the default
+SH float16 is an explicit storage quantization, followed by lossless transport.
 
-Geometry: 64 bytes/particle, four little-endian float32 vec4 records:
-  [center.xyz, activated_density], [world_to_local_row0.xyz, kernel_radius],
-  [world_to_local_row1.xyz, 0], [world_to_local_row2.xyz, 0].
-SH: 192 bytes/particle (float32) or 96 bytes/particle (float16),
-  16 RGB coefficients with DC first, in the same order for both types.
-BVH: 32 bytes/node, [min.xyz, left:u32], [max.xyz, right_or_count:u32].
-  Internal nodes hold two node indices. Leaves set count's high bit and use
-  left as the first particle index. All particle buffers follow leaf order.
+Geometry: 48 little-endian bytes per Gaussian, three float32 vec4s:
+  [center.xyz, sigmoid opacity], [cov_xx,cov_xy,cov_xz,cov_yy],
+  [cov_yz,cov_zz,0,0], with covariance R*diag(exp(scale)^2)*R^T.
+SH: 48 RGB-interleaved values, DC first; 96 bytes float16 or 192 bytes float32.
+No BVH, ray-tracing kernel conversion, Gaussian pruning or reordering is used.
 """
 
 import argparse
 import gzip
 import hashlib
-import importlib.util
 import json
 import math
+import os
 from pathlib import Path
 import shutil
-import sys
+import struct
 import tempfile
 import zlib
 
 import numpy as np
 
-
-SCHEMA = "fullcircle-webgpu-reference-v1"
-LEAF_BIT = np.uint32(0x80000000)
-BVH_DTYPE = np.dtype([
-    ("minimum", "<f4", 3), ("left", "<u4"),
-    ("maximum", "<f4", 3), ("right_or_count", "<u4"),
-])
+SCHEMA = "fullcircle-webgl2-ewa-v1"
 REPO_ROOT = Path(__file__).resolve().parents[1]
-
+COMPRESSION_MODES = ("none", "gzip", "gzip-shuffle")
+MAX_PART_BYTES = 100 * 1024 * 1024
+SH_DTYPES = {"float32": np.dtype("<f4"), "float16": np.dtype("<f2")}
 
 def _register_resolvers():
     from omegaconf import OmegaConf
@@ -83,64 +74,6 @@ def load_checkpoint(path):
     return checkpoint
 
 
-def validate_config(checkpoint):
-    """Reject variants whose native forward semantics this format cannot encode."""
-    _register_resolvers()
-    conf = checkpoint["config"]
-    expected = {
-        "render.method": "3dgrt",
-        "render.pipeline_type": "reference",
-        "render.primitive_type": "instances",
-        "render.particle_kernel_degree": 4,
-        "model.density_activation": "sigmoid",
-        "model.scale_activation": "exp",
-    }
-    for key, expected_value in expected.items():
-        actual = _config_value(conf, key)
-        if actual != expected_value:
-            raise ValueError(f"Unsupported {key}={actual!r}; expected {expected_value!r}")
-    if _config_value(conf, "post_processing.method") is not None:
-        raise ValueError("Checkpoint post-processing is not supported by this exporter")
-    if _config_value(conf, "model.progressive_training.feature_type", "sh") != "sh":
-        raise ValueError("Only spherical-harmonic radiance is supported")
-    maximum = int(checkpoint["max_n_features"])
-    active = int(checkpoint["n_active_features"])
-    if not 0 <= active <= maximum <= 3:
-        raise ValueError("Expected SH degrees 0 <= active <= maximum <= 3")
-    if _config_value(conf, "render.particle_radiance_sph_degree", 3) != 3:
-        raise ValueError("This exporter requires the native 16-coefficient SH pipeline")
-
-    # referenceOptix hard-codes these in optixTracer.cpp/processHit(). Do not
-    # export changed config values that would misleadingly imply they took effect.
-    alpha_min = float(_config_value(conf, "render.particle_kernel_min_alpha", 1 / 255))
-    alpha_max = float(_config_value(conf, "render.particle_kernel_max_alpha", 0.99))
-    if not math.isclose(alpha_min, 1 / 255, rel_tol=1e-7) or not math.isclose(alpha_max, 0.99, rel_tol=1e-7):
-        raise ValueError("reference pipeline uses fixed min alpha 1/255 and max alpha 0.99")
-    response = float(_config_value(conf, "render.particle_kernel_min_response", 0.0113))
-    transmittance = float(_config_value(conf, "render.min_transmittance", 0.001))
-    if not 0 < response < 1 or not 0 < transmittance < 1:
-        raise ValueError("Response and transmittance thresholds must be finite and between 0 and 1")
-    clamped = _config_value(conf, "render.particle_kernel_density_clamping", True)
-    if not isinstance(clamped, bool):
-        raise ValueError("particle_kernel_density_clamping must be a boolean")
-    background_name = _config_value(conf, "model.background.name", "background-color")
-    background_color = _config_value(conf, "model.background.color", "black")
-    if background_name == "skip-background":
-        background = [0.0, 0.0, 0.0]
-    elif background_name == "background-color" and background_color in ("black", "white", "random"):
-        # Native random background is black during inference.
-        background = [1.0, 1.0, 1.0] if background_color == "white" else [0.0, 0.0, 0.0]
-    else:
-        raise ValueError(f"Unsupported background {background_name!r}/{background_color!r}")
-    return {
-        "pipeline": "reference", "primitive_type": "instances", "kernel_degree": 4,
-        "density_clamping": clamped, "min_response": response,
-        "min_alpha": 1 / 255, "max_alpha": 0.99,
-        "min_transmittance": transmittance, "sh_degree": active,
-        "sh_direction": "world_ray", "background": background,
-    }
-
-
 def _cpu_float32(checkpoint, name, shape):
     import torch
 
@@ -150,274 +83,6 @@ def _cpu_float32(checkpoint, name, shape):
     if tuple(value.shape) != tuple(shape) or not torch.isfinite(value).all():
         raise ValueError(f"{name} must have shape {shape} and contain finite values")
     return value.detach()
-
-
-def prepare_gaussians(checkpoint, render):
-    """Activate parameters on CPU, preserving all particles and FP32 SH data."""
-    import torch
-
-    positions = checkpoint["positions"]
-    if not isinstance(positions, torch.Tensor) or positions.ndim != 2 or positions.shape[1] != 3:
-        raise ValueError("positions must have shape [N, 3]")
-    count = positions.shape[0]
-    if not 0 < count < 0x80000000:
-        raise ValueError("Expected a nonempty model with fewer than 2^31 particles")
-    positions = _cpu_float32(checkpoint, "positions", (count, 3)).numpy()
-    raw_scale = _cpu_float32(checkpoint, "scale", (count, 3))
-    raw_density = _cpu_float32(checkpoint, "density", (count, 1))
-    raw_rotation = _cpu_float32(checkpoint, "rotation", (count, 4))
-    scales = torch.exp(raw_scale).numpy()
-    density = torch.sigmoid(raw_density).numpy()[:, 0]
-    # Native get_rotation() uses torch.nn.functional.normalize (eps=1e-12).
-    quaternions = torch.nn.functional.normalize(raw_rotation, dim=1).numpy()
-    if not np.isfinite(scales).all() or np.any(scales <= 0):
-        raise ValueError("Activated scales must be positive and finite")
-    w, x, y, z = quaternions.T
-    rotation = np.empty((count, 3, 3), dtype=np.float32)
-    rotation[:, 0, 0] = 1 - 2 * (y*y + z*z)
-    rotation[:, 0, 1] = 2 * (x*y - w*z)
-    rotation[:, 0, 2] = 2 * (x*z + w*y)
-    rotation[:, 1, 0] = 2 * (x*y + w*z)
-    rotation[:, 1, 1] = 1 - 2 * (x*x + z*z)
-    rotation[:, 1, 2] = 2 * (y*z - w*x)
-    rotation[:, 2, 0] = 2 * (x*z - w*y)
-    rotation[:, 2, 1] = 2 * (y*z + w*x)
-    rotation[:, 2, 2] = 1 - 2 * (x*x + y*y)
-    local_matrix = rotation.transpose(0, 2, 1) / scales[:, :, None]
-    if not np.isfinite(local_matrix).all():
-        raise ValueError("World-to-local matrices overflow float32")
-    modulation = density if render["density_clamping"] else np.ones(count, dtype=np.float32)
-    with np.errstate(divide="ignore"):
-        threshold = np.minimum(np.float32(render["min_response"]) / modulation, np.float32(0.97))
-    radius = np.power(np.log(threshold) / np.float32(-4.5 / 81), np.float32(0.25))
-    geometry = np.zeros((count, 16), dtype="<f4")
-    geometry[:, :3], geometry[:, 3] = positions, density
-    for row in range(3):
-        geometry[:, 4 + row * 4:7 + row * 4] = local_matrix[:, row]
-    geometry[:, 7] = radius
-
-    # Use the exact packed matrix's inverse for conservative software-BVH
-    # bounds. Its tiny FP32 difference from R*S is recorded in the manifest.
-    # Compute in chunks to keep export memory bounded for larger models.
-    minimum, maximum = np.empty_like(positions), np.empty_like(positions)
-    for start in range(0, count, 65536):
-        end = min(start + 65536, count)
-        inverse = np.linalg.inv(local_matrix[start:end].astype(np.float64))
-        extent = np.sum(np.abs(inverse), axis=2) * radius[start:end, None]
-        minimum[start:end] = np.nextafter((positions[start:end] - extent).astype(np.float32), -np.inf)
-        maximum[start:end] = np.nextafter((positions[start:end] + extent).astype(np.float32), np.inf)
-    if not np.isfinite(minimum).all() or not np.isfinite(maximum).all():
-        raise ValueError("Particle bounds overflow float32")
-
-    maximum_degree = int(checkpoint["max_n_features"])
-    coefficient_count = (maximum_degree + 1) ** 2
-    dc = _cpu_float32(checkpoint, "features_albedo", (count, 3)).numpy()
-    rest = _cpu_float32(checkpoint, "features_specular", (count, (coefficient_count - 1) * 3)).numpy()
-    sh = np.zeros((count, 16, 3), dtype="<f4")
-    sh[:, 0] = dc
-    sh[:, 1:coefficient_count] = rest.reshape(count, coefficient_count - 1, 3)
-    return geometry, sh.reshape(count, 48), minimum, maximum
-
-
-def _surface_area(minimum, maximum):
-    """Evaluate areas in float64, including large but finite float32 bounds."""
-    extent = np.maximum(np.asarray(maximum, dtype=np.float64) - minimum, 0)
-    return 2 * (extent[..., 0] * extent[..., 1] + extent[..., 1] * extent[..., 2] + extent[..., 2] * extent[..., 0])
-
-
-def _sah_partition(points, minimum, maximum, bins):
-    """Return a deterministic valid binned-SAH left mask, or None to fall back."""
-    best_cost, best_mask = math.inf, None
-    count = len(points)
-    for axis in range(3):
-        coordinates = points[:, axis]
-        low, high = float(coordinates.min()), float(coordinates.max())
-        if not high > low:
-            continue
-        bin_ids = np.minimum(((coordinates - low) / (high - low) * bins).astype(np.int64), bins - 1)
-        counts = np.bincount(bin_ids, minlength=bins)
-        bin_min = np.full((bins, 3), np.inf, dtype=np.float64)
-        bin_max = np.full((bins, 3), -np.inf, dtype=np.float64)
-        np.minimum.at(bin_min, bin_ids, minimum)
-        np.maximum.at(bin_max, bin_ids, maximum)
-        left_counts = np.cumsum(counts)[:-1]
-        right_counts = count - left_counts
-        valid = (left_counts > 0) & (right_counts > 0)
-        if not valid.any():
-            continue
-        left_min = np.minimum.accumulate(bin_min, axis=0)[:-1]
-        left_max = np.maximum.accumulate(bin_max, axis=0)[:-1]
-        right_min = np.minimum.accumulate(bin_min[::-1], axis=0)[::-1][1:]
-        right_max = np.maximum.accumulate(bin_max[::-1], axis=0)[::-1][1:]
-        costs = np.full(bins - 1, np.inf)
-        costs[valid] = (_surface_area(left_min[valid], left_max[valid]) * left_counts[valid]
-                        + _surface_area(right_min[valid], right_max[valid]) * right_counts[valid])
-        split = int(np.argmin(costs))
-        # Fixed axis/bin iteration and strict comparison make equal costs
-        # deterministic; no random sampling participates in tree construction.
-        if costs[split] < best_cost:
-            best_cost = float(costs[split])
-            best_mask = bin_ids <= split
-    return best_mask
-
-
-def build_bvh(minimum, maximum, leaf_size=8, method="sah", bins=12, max_depth=62):
-    """Build a depth-bounded BVH and return nodes, permutation, actual depth.
-
-    SAH uses 12 bins per axis by default. Median splits remain available for
-    reproducible comparison and are mandatory when centroid bins degenerate
-    or when remaining depth must be reserved for a balanced subtree.
-    """
-    minimum, maximum = np.asarray(minimum, dtype=np.float32), np.asarray(maximum, dtype=np.float32)
-    count = len(minimum)
-    if minimum.shape != (count, 3) or maximum.shape != minimum.shape or count < 1:
-        raise ValueError("Bounds must be nonempty matching [N,3] arrays")
-    if not np.isfinite(minimum).all() or not np.isfinite(maximum).all() or np.any(minimum > maximum):
-        raise ValueError("Invalid particle bounds")
-    if not 1 <= leaf_size <= 64:
-        raise ValueError("leaf_size must be between 1 and 64")
-    if method not in ("sah", "median") or not 2 <= bins <= 64:
-        raise ValueError("Expected bvh method 'sah'/'median' and 2..64 SAH bins")
-    minimum_depth = ((count + leaf_size - 1) // leaf_size - 1).bit_length()
-    if not minimum_depth <= max_depth <= 62:
-        raise ValueError("BVH depth budget must fit a balanced tree and be at most 62")
-    centroids = (minimum.astype(np.float64) + maximum.astype(np.float64)) * 0.5
-    order = np.arange(count, dtype=np.uint32)
-    # Unlike median trees, a useful SAH split can isolate a single outlier.
-    # The full binary-tree bound is necessary even when leaf_size is eight.
-    capacity = 2 * count - 1
-    nodes = np.empty(capacity, dtype=BVH_DTYPE)
-    node_count, actual_depth = 0, 0
-
-    def visit(start, end, depth):
-        nonlocal node_count, actual_depth
-        index = node_count
-        node_count += 1
-        actual_depth = max(actual_depth, depth)
-        indices = order[start:end]
-        node = nodes[index]
-        node["minimum"] = minimum[indices].min(axis=0)
-        node["maximum"] = maximum[indices].max(axis=0)
-        if end - start <= leaf_size:
-            node["left"] = start
-            node["right_or_count"] = LEAF_BIT | np.uint32(end - start)
-            return index
-        points = centroids[indices]
-        size = end - start
-        required_depth = ((size + leaf_size - 1) // leaf_size - 1).bit_length()
-        mask = None
-        if method == "sah" and depth + required_depth < max_depth:
-            mask = _sah_partition(points, minimum[indices], maximum[indices], bins)
-        if mask is not None and 0 < int(mask.sum()) < size:
-            middle = int(mask.sum())
-            order[start:end] = np.concatenate((indices[mask], indices[~mask]))
-        else:
-            axis = int(np.argmax(points.max(axis=0) - points.min(axis=0)))
-            middle = size // 2
-            # Stable ordering also handles identical centroids predictably.
-            permutation = np.argsort(points[:, axis], kind="stable")
-            order[start:end] = indices[permutation]
-        split = start + middle
-        node["left"] = visit(start, split, depth + 1)
-        node["right_or_count"] = visit(split, end, depth + 1)
-        return index
-
-    visit(0, count, 0)
-    if node_count >= 0x80000000:
-        raise ValueError("BVH node indices exceed the reserved leaf-bit format")
-    return nodes[:node_count].copy(), order, actual_depth
-
-
-def bvh_statistics(nodes):
-    """Return a geometric cost estimate; this is not a measured GPU frame time."""
-    leaf = (nodes["right_or_count"] & LEAF_BIT) != 0
-    counts = (nodes["right_or_count"][leaf] & np.uint32(0x7fffffff)).astype(np.float64)
-    area = _surface_area(nodes["minimum"], nodes["maximum"])
-    weighted_area = float(area[~leaf].sum() + (area[leaf] * counts).sum())
-    return {
-        "leaf_count": int(leaf.sum()), "mean_leaf_size": float(counts.mean()),
-        "max_leaf_size": int(counts.max()),
-        "estimated_sah_cost": weighted_area / float(area[0]) if area[0] > 0 else 0.0,
-    }
-
-
-def reference_instance_hit(record, origin, direction, t_min=0.0, t_max=1e20):
-    """CPU scalar oracle for native instance support, hit order, and quartic alpha.
-
-    Returns (distance, kernel_response, alpha) for a supported native candidate.
-    It does not apply response/alpha thresholds, SH, or compositing. Tests can
-    distinguish the instance candidate test from response acceptance.
-    """
-    record = np.asarray(record)
-    matrix = record.reshape(4, 4)[1:, :3].astype(np.float64)
-    origin = matrix @ (np.asarray(origin, dtype=np.float64) - record[:3])
-    direction = matrix @ np.asarray(direction, dtype=np.float64)
-    radius = float(record[7])
-    entry, exit = float(t_min), float(t_max)
-    for axis in range(3):
-        if direction[axis] == 0:
-            if abs(origin[axis]) > radius:
-                return None
-        else:
-            a = (-radius - origin[axis]) / direction[axis]
-            b = (radius - origin[axis]) / direction[axis]
-            entry, exit = max(entry, min(a, b)), min(exit, max(a, b))
-    if entry > exit:
-        return None
-    norm2 = float(np.dot(direction, direction))
-    if norm2 <= 0:
-        return None
-    distance = -float(np.dot(origin, direction)) / norm2
-    if not t_min < distance < t_max:
-        return None
-    squared_distance = float(np.dot(np.cross(direction / math.sqrt(norm2), origin),
-                                    np.cross(direction / math.sqrt(norm2), origin)))
-    # Exact reference CUDA instance predicate, rather than a replacement
-    # ellipsoid-surface intersection. kernel_radius cancels from this ratio.
-    if squared_distance / norm2 >= 9:
-        return None
-    response = math.exp(-squared_distance * squared_distance / 18)
-    return distance, response, min(0.99, response * float(record[3]))
-
-
-def _load_camera_module():
-    name = "fullcircle_webgpu_export_cameras"
-    if name not in sys.modules:
-        path = REPO_ROOT / "WebViewer-V2" / "cameras.py"
-        spec = importlib.util.spec_from_file_location(name, path)
-        module = importlib.util.module_from_spec(spec)
-        sys.modules[name] = module
-        spec.loader.exec_module(module)
-    return sys.modules[name]
-
-
-def export_cameras(checkpoint, positions, camera_json=None, data_path=None, fov_y=math.radians(70)):
-    module = _load_camera_module()
-    if camera_json:
-        presets = module.load_camera_json(camera_json)
-        source = "camera JSON"
-    else:
-        path = Path(data_path or str(_config_value(checkpoint["config"], "path", ""))).expanduser()
-        candidates = [path] if path.is_absolute() else [Path.cwd() / path, REPO_ROOT / path]
-        presets = []
-        for candidate in candidates:
-            presets = module.load_colmap_cameras(candidate, fov_y)
-            if presets:
-                break
-        source = "COLMAP training poses, perspective preview"
-        if not presets:
-            presets = [module.camera_from_bounds(positions, fov_y)]
-            source = "Gaussian bounds fallback"
-    return [
-        {"name": preset.name, "position": preset.position.tolist(),
-         "rotation": preset.c2w[:3, :3].tolist(), "fov_y": preset.fov_y, "aspect": preset.aspect}
-        for preset in presets
-    ], source
-
-
-COMPRESSION_MODES = ("none", "gzip", "gzip-shuffle")
-MAX_PART_BYTES = 100 * 1024 * 1024
-SH_DTYPES = {"float32": np.dtype("<f4"), "float16": np.dtype("<f2")}
 
 
 def convert_sh_bytes(data, source_dtype, target_dtype):
@@ -440,19 +105,6 @@ def convert_sh_bytes(data, source_dtype, target_dtype):
     return converted.tobytes()
 
 
-def set_sh_precision_metadata(manifest, target_dtype, source_spec=None):
-    """Record half rounding even if a later repack expands storage to float32."""
-    source_spec = source_spec or {}
-    output_spec = manifest["files"]["sh"]
-    output_spec["dtype"] = target_dtype
-    had_half_rounding = (target_dtype == "float16" or source_spec.get("dtype") == "float16"
-                         or source_spec.get("quantization_dtype") == "float16")
-    if had_half_rounding:
-        output_spec["quantization_dtype"] = "float16"
-        description = "float16 (quantized)" if target_dtype == "float16" else "float32 expanded from float16; earlier rounding is retained"
-        manifest["precision"] = f"geometry storage float32; SH storage {description}; BVH float32/u32; no additional pruning"
-
-
 def _shuffle_bytes(data, width, inverse=False):
     if width not in (2, 4):
         raise ValueError("Byte shuffle width must be 2 or 4")
@@ -472,7 +124,7 @@ def shuffle_bytes4(data, inverse=False):
 
     Four-byte words [a0 a1 a2 a3][b0 b1 b2 b3] become
     [a0 b0][a1 b1][a2 b2][a3 b3]. Each file part is transformed independently.
-    This works equally for float32 geometry/SH and the mixed float/u32 BVH.
+    This operates on bytes only and preserves every float32 bit pattern.
     """
     return _shuffle_bytes(data, 4, inverse)
 
@@ -562,121 +214,286 @@ def write_parts(directory, name, array, stride, max_bytes, compression="none", *
             "stride": stride, "parts": parts}
 
 
-def export_checkpoint(checkpoint, output, *, source_name="checkpoint.pt", leaf_size=8,
-                      bvh_method="sah", sah_bins=12,
-                      chunk_bytes=64 * 1024 * 1024, camera_json=None, data_path=None,
-                      fov_y=math.radians(70), overwrite=False, compression="none", sh_dtype="float32"):
-    output = Path(output)
-    if output.exists() and (not output.is_dir() or (any(output.iterdir()) and not overwrite)):
-        raise FileExistsError(f"Output already exists: {output}; choose another directory or pass --overwrite")
+def set_sh_precision_metadata(manifest, target_dtype, source_spec=None):
+    source_spec = source_spec or {}
+    spec = manifest["files"]["sh"]
+    spec["dtype"] = target_dtype
+    rounded = (target_dtype == "float16" or source_spec.get("dtype") == "float16"
+               or source_spec.get("quantization_dtype") == "float16")
+    if rounded:
+        spec["quantization_dtype"] = "float16"
+    description = ("float16 quantized" if target_dtype == "float16" else
+                   "float32 expanded from float16; earlier rounding retained" if rounded else "float32")
+    manifest["precision"] = f"FP32 centers, opacity and covariance; SH {description}; no pruning or reordering"
+
+
+def validate_config(checkpoint):
+    """Require actual quadratic raster training; never relabel a 3DGRT model."""
+    _register_resolvers()
+    conf = checkpoint["config"]
+    for key, expected in {
+        "render.method": "3dgs", "render.depth_sort": "radial",
+        "render.particle_kernel_degree": 2, "model.density_activation": "sigmoid",
+        "model.scale_activation": "exp",
+    }.items():
+        actual = _config_value(conf, key)
+        if actual != expected:
+            raise ValueError(f"Unsupported {key}={actual!r}; expected {expected!r}")
+    if _config_value(conf, "post_processing.method") is not None:
+        raise ValueError("Checkpoint image post-processing cannot be discarded")
+    if _config_value(conf, "model.progressive_training.feature_type", "sh") != "sh":
+        raise ValueError("Only SH radiance is supported")
+    active, maximum = checkpoint["n_active_features"], checkpoint["max_n_features"]
+    if (isinstance(active, bool) or isinstance(maximum, bool) or int(active) != active
+            or int(maximum) != maximum or not 0 <= int(active) <= int(maximum) <= 3):
+        raise ValueError("Expected integer SH degrees 0 <= active <= maximum <= 3")
+    if int(_config_value(conf, "render.particle_radiance_sph_degree", 3)) < maximum:
+        raise ValueError("Checkpoint SH degree exceeds the configured renderer")
+    antialiasing = _config_value(conf, "render.antialiasing", False)
+    if antialiasing is not False:
+        raise ValueError("This WebGL2 exporter currently requires render.antialiasing=false")
+    near = float(_config_value(conf, "render.near_plane", .01))
+    if not math.isfinite(near) or near <= 0:
+        raise ValueError("The native near plane must be finite and positive")
+    name = _config_value(conf, "model.background.name", "background-color")
+    color = _config_value(conf, "model.background.color", "black")
+    if name == "skip-background":
+        background = [0., 0., 0.]
+    elif name == "background-color" and color in ("black", "white"):
+        background = [float(color == "white")] * 3
+    else:
+        raise ValueError("Only black, white or skip backgrounds can be preserved")
+    return {"method": "3dgs", "pipeline": "2d-ewa", "kernel_degree": 2,
+            "depth_sort": "radial", "sh_degree": int(active), "sh_direction": "camera_to_gaussian",
+            "min_alpha": 1 / 255, "max_alpha": .99, "min_transmittance": .0001,
+            "low_pass_variance": .3, "antialiasing": False, "near_plane": near,
+            "background": background}
+
+
+def prepare_gaussians(checkpoint, render=None):
+    """Activate and precompute native world covariance using FP32 CPU math."""
+    import torch
+
+    if render is None:
+        render = validate_config(checkpoint)
+    positions = checkpoint["positions"]
+    if not isinstance(positions, torch.Tensor) or positions.ndim != 2 or positions.shape[1] != 3:
+        raise ValueError("positions must be shaped [N,3]")
+    count = len(positions)
+    if not 0 < count < 0x80000000:
+        raise ValueError("Expected 1..2^31-1 Gaussian records")
+    positions = _cpu_float32(checkpoint, "positions", (count, 3)).numpy()
+    scales = torch.exp(_cpu_float32(checkpoint, "scale", (count, 3))).numpy()
+    opacity = torch.sigmoid(_cpu_float32(checkpoint, "density", (count, 1))).numpy()
+    quaternion = torch.nn.functional.normalize(_cpu_float32(checkpoint, "rotation", (count, 4)), dim=1).numpy()
+    if not np.isfinite(scales).all() or np.any(scales <= 0):
+        raise ValueError("Activated scales must remain positive and finite")
+    w, x, y, z = quaternion.T
+    rotation = np.empty((count, 3, 3), dtype=np.float32)
+    rotation[:, 0, 0], rotation[:, 0, 1], rotation[:, 0, 2] = 1-2*(y*y+z*z), 2*(x*y-w*z), 2*(x*z+w*y)
+    rotation[:, 1, 0], rotation[:, 1, 1], rotation[:, 1, 2] = 2*(x*y+w*z), 1-2*(x*x+z*z), 2*(y*z-w*x)
+    rotation[:, 2, 0], rotation[:, 2, 1], rotation[:, 2, 2] = 2*(x*z-w*y), 2*(y*z+w*x), 1-2*(x*x+y*y)
+    with np.errstate(over="ignore", invalid="ignore"):
+        factor = rotation * scales[:, None, :]
+        covariance = factor @ factor.transpose(0, 2, 1)
+    if not np.isfinite(covariance).all():
+        raise ValueError("Gaussian covariance overflows FP32")
+    geometry = np.zeros((count, 12), dtype="<f4")
+    geometry[:, :3], geometry[:, 3] = positions, opacity[:, 0]
+    geometry[:, 4:10] = covariance[:, [0, 0, 0, 1, 1, 2], [0, 1, 2, 1, 2, 2]]
+    coefficients = (int(checkpoint["max_n_features"]) + 1) ** 2
+    dc = _cpu_float32(checkpoint, "features_albedo", (count, 3)).numpy()
+    rest = _cpu_float32(checkpoint, "features_specular", (count, (coefficients - 1) * 3)).numpy()
+    sh = np.zeros((count, 16, 3), dtype="<f4")
+    sh[:, 0], sh[:, 1:coefficients] = dc, rest.reshape(count, coefficients - 1, 3)
+    return geometry, sh.reshape(count, 48)
+
+
+def _camera(name, position, rotation, fov_y, aspect=4 / 3):
+    position, rotation = np.asarray(position, np.float64), np.asarray(rotation, np.float64)
+    if (position.shape != (3,) or rotation.shape != (3, 3) or not np.isfinite(position).all()
+            or not np.isfinite(rotation).all() or not np.allclose(rotation.T @ rotation, np.eye(3), atol=1e-4)
+            or not np.isclose(np.linalg.det(rotation), 1, atol=1e-4)):
+        raise ValueError(f"Invalid camera pose: {name}")
+    if not math.isfinite(fov_y) or not 0 < fov_y < math.pi or not math.isfinite(aspect) or aspect <= 0:
+        raise ValueError(f"Invalid camera projection: {name}")
+    return {"name": str(name), "position": position.tolist(), "rotation": rotation.tolist(),
+            "fov_y": float(fov_y), "aspect": float(aspect)}
+
+
+def _colmap_camera(name, quaternion, translation, fov_y):
+    q = np.asarray(quaternion, np.float64)
+    if not np.isfinite(q).all() or np.linalg.norm(q) < 1e-12:
+        raise ValueError("Invalid COLMAP quaternion")
+    w, x, y, z = q / np.linalg.norm(q)
+    rotation = np.array([[1-2*(y*y+z*z), 2*(x*y-w*z), 2*(x*z+w*y)],
+                         [2*(x*y+w*z), 1-2*(x*x+z*z), 2*(y*z-w*x)],
+                         [2*(x*z-w*y), 2*(y*z+w*x), 1-2*(x*x+y*y)]])
+    return _camera(name, -rotation.T @ np.asarray(translation), rotation.T, fov_y)
+
+
+def export_cameras(checkpoint, positions, camera_json=None, data_path=None, fov_y=math.radians(70)):
+    """Self-contained CPU COLMAP extrinsics reader; no V2/WebGPU dependency."""
+    if camera_json:
+        entries = json.loads(Path(camera_json).read_text())
+        if not isinstance(entries, list) or not entries:
+            raise ValueError("Camera JSON must contain a nonempty list")
+        cameras = []
+        for index, entry in enumerate(entries):
+            if "fov_y" in entry:
+                fov, aspect = float(entry["fov_y"]), float(entry.get("aspect", 4/3))
+            else:
+                width, height, fy = (float(entry[key]) for key in ("width", "height", "fy"))
+                if not all(math.isfinite(v) and v > 0 for v in (width, height, fy)):
+                    raise ValueError("Camera width/height/fy must be positive and finite")
+                fov, aspect = 2 * math.atan(height/(2*fy)), width/height
+            cameras.append(_camera(entry.get("name", entry.get("img_name", f"camera_{index}")),
+                                   entry["position"], entry["rotation"], fov, aspect))
+        return cameras, "camera JSON"
+    path = Path(data_path or str(_config_value(checkpoint["config"], "path", ""))).expanduser()
+    candidates = [path] if path.is_absolute() else [Path.cwd()/path, REPO_ROOT/path]
+    suffix = str(_config_value(checkpoint["config"], "dataset.test_frame_suffix", "_test"))
+    for candidate in candidates:
+        sparse = candidate / "sparse" / "0"
+        binary, text = sparse / "images.bin", sparse / "images.txt"
+        cameras = []
+        if binary.is_file():
+            with binary.open("rb") as stream:
+                count = struct.unpack("<Q", stream.read(8))[0]
+                size = binary.stat().st_size
+                for _ in range(count):
+                    record = struct.unpack("<idddddddi", stream.read(64))
+                    name = bytearray()
+                    while True:
+                        char = stream.read(1)
+                        if char == b"\0":
+                            break
+                        if not char:
+                            raise ValueError("Truncated COLMAP image name")
+                        name.extend(char)
+                    points = struct.unpack("<Q", stream.read(8))[0]
+                    if points > (size - stream.tell()) // 24:
+                        raise ValueError("Truncated COLMAP observations")
+                    stream.seek(points * 24, 1)
+                    name = name.decode("utf-8")
+                    if not suffix or not Path(name).stem.endswith(suffix):
+                        cameras.append(_colmap_camera(name, record[1:5], record[5:8], fov_y))
+        elif text.is_file():
+            with text.open() as stream:
+                for line in stream:
+                    if not line.strip() or line.lstrip().startswith("#"):
+                        continue
+                    values = line.split()
+                    if len(values) < 10:
+                        raise ValueError("Invalid COLMAP camera record")
+                    name = " ".join(values[9:])
+                    if not suffix or not Path(name).stem.endswith(suffix):
+                        cameras.append(_colmap_camera(name, list(map(float, values[1:5])),
+                                                       list(map(float, values[5:8])), fov_y))
+                    if next(stream, None) is None:
+                        raise ValueError("Missing COLMAP observations line")
+        if cameras:
+            return sorted(cameras, key=lambda c: (Path(c["name"]).name, c["name"])), "COLMAP poses; virtual pinhole preview"
+    lower, upper = np.quantile(positions, [.05, .95], axis=0)
+    center, radius = (lower+upper)/2, max(float(np.linalg.norm(upper-lower))/2, .1)
+    position = center - [0, 0, radius/math.tan(fov_y/2)]
+    return [_camera("Scene overview", position, np.eye(3), fov_y)], "robust center bounds fallback"
+
+
+def export_checkpoint(checkpoint, output, *, source_name="checkpoint.pt", chunk_bytes=64*1024*1024,
+                      camera_json=None, data_path=None, fov_y=math.radians(70),
+                      overwrite=False, compression="gzip-shuffle", sh_dtype="float16"):
+    output = Path(output).expanduser()
+    if output.is_symlink() or (output.exists() and (not output.is_dir() or not overwrite)):
+        raise FileExistsError(f"Output exists: {output}; choose a new directory or explicitly --overwrite")
     if not math.isfinite(fov_y) or not 0 < fov_y < math.pi:
-        raise ValueError("Preview vertical FOV must be between 0 and pi")
-    if compression not in COMPRESSION_MODES:
-        raise ValueError(f"Unsupported compression: {compression}")
-    if sh_dtype not in SH_DTYPES:
-        raise ValueError("SH dtype must be float16 or float32")
+        raise ValueError("Preview vertical field of view must be between 0 and pi")
+    if compression not in COMPRESSION_MODES or sh_dtype not in SH_DTYPES:
+        raise ValueError("Invalid compression or SH dtype")
     render = validate_config(checkpoint)
-    geometry, sh, minimum, maximum = prepare_gaussians(checkpoint, render)
+    geometry, sh = prepare_gaussians(checkpoint, render)
     cameras, camera_source = export_cameras(checkpoint, geometry[:, :3], camera_json, data_path, fov_y)
-    nodes, order, depth = build_bvh(minimum, maximum, leaf_size, method=bvh_method, bins=sah_bins)
-    geometry, sh = geometry[order], sh[order]
-    if sh_dtype == "float16":
+    if sh_dtype != "float32":
         sh = np.frombuffer(convert_sh_bytes(sh.tobytes(), "float32", sh_dtype), dtype=SH_DTYPES[sh_dtype]).reshape(-1, 48)
+    positions = geometry[:, :3]
+    navigation = np.quantile(positions, [.05, .95], axis=0)
     manifest = {
-        "schema": SCHEMA, "source": Path(source_name).name,
-        "gaussian_count": len(geometry), "bvh_node_count": len(nodes), "bvh_max_depth": depth,
-        "bvh_root": 0, "bvh_leaf_size": leaf_size,
-        "bvh_method": bvh_method, "bvh_sah_bins": sah_bins if bvh_method == "sah" else None,
-        "bvh_stats": bvh_statistics(nodes),
-        "bounds": {"min": nodes[0]["minimum"].tolist(), "max": nodes[0]["maximum"].tolist()},
+        "schema": SCHEMA, "source": Path(source_name).name, "gaussian_count": len(geometry),
+        "bounds": {"min": positions.min(0).tolist(), "max": positions.max(0).tolist()},
+        "bounds_definition": "complete Gaussian center bounds; Gaussian support is not finite",
+        "navigation_bounds": {"min": navigation[0].tolist(), "max": navigation[1].tolist()},
         "render": render, "cameras": cameras, "default_camera": 0, "camera_source": camera_source,
-        "precision": "float32, no quantization or pruning", "byte_order": "little-endian",
-        "native_support": {
-            "bound": "density-clamped transformed cube (native instances)",
-            "kernel_radius": "pow(log(min(min_response/density,0.97))/(-1/18),1/4) when clamped",
-            "hit_distance": "-dot(local_origin,local_direction)/dot(local_direction,local_direction)",
-            "instance_predicate": "cross(normalize(local_direction),local_origin)^2 / dot(local_direction,local_direction) < 9",
-            "color": "per-world-ray SH with native +0.5 and lower clamp, front-to-back alpha compositing",
-            "ordering": "native reference gathers the nearest 16 candidates per trace, continuing while T>threshold",
-        },
+        "byte_order": "little-endian", "gaussian_order": "checkpoint order; no pruning",
+        "native_support": {"covariance": "R diag(exp(scale)^2) R^T in original model coordinates",
+                           "projection": "pinhole Jacobian with native 1.3*tan(FOV) clamp and 0.3 pixel variance",
+                           "color": "camera-to-Gaussian normalized direction SH; +0.5 then lower clamp at zero",
+                           "ordering": "radial distance; preserve checkpoint index for equal keys"},
         "known_differences": [
-            "CPU activation/normalization and precomputed FP32 inverse transforms can differ by rounding from CUDA/OptiX.",
-            "Software BVH traversal and equal-distance tie ordering can differ from OptiX; bitwise identity is not promised.",
-            "Browser transcendentals and final display/color conversion require comparison with V2 on fixed cameras.",
+            "CPU FP32 activation/covariance and browser math can round differently from CUDA.",
+            "WebGL fixed-function blending does not implement CUDA's per-pixel early transmittance termination; the crossing contribution can differ.",
+            "Framebuffer accumulation uses the best available float32/float16/unorm8 format; unorm8 is a lower-precision fallback.",
+            "World-space radial sort keys can differ from CUDA camera-space keys at near-equal float32 depths.",
+            "Float16 SH is optional quantization; geometry remains FP32 and no Gaussians are pruned.",
         ],
     }
+    step = checkpoint.get("global_step")
+    if step is not None:
+        manifest["training_step"] = int(step)
     output.parent.mkdir(parents=True, exist_ok=True)
     old_parts = set()
-    old_manifest = output / "manifest.json"
-    if overwrite and old_manifest.is_file():
-        old = json.loads(old_manifest.read_text())
-        for buffer in old.get("files", {}).values():
-            for part in buffer.get("parts", []):
+    if overwrite and (output / "manifest.json").is_file():
+        previous = json.loads((output / "manifest.json").read_text())
+        if previous.get("schema") != SCHEMA:
+            raise ValueError("Refusing to overwrite a model with a different schema")
+        for spec in previous.get("files", {}).values():
+            for part in spec.get("parts", []):
                 name = part.get("path", "")
                 if name and Path(name).name == name and name not in ("alignment.json", "cameras.json", "manifest.json"):
                     old_parts.add(name)
-    # Complete the export in a sibling staging directory before touching the
-    # requested destination. Manifest is installed last to mark completion.
-    with tempfile.TemporaryDirectory(prefix=".webgpu-export-", dir=output.parent) as temporary:
+    with tempfile.TemporaryDirectory(prefix=".webgl2-export-", dir=output.parent) as temporary:
         stage = Path(temporary)
         manifest["files"] = {
-            "geometry": write_parts(stage, "geometry", geometry, 64, chunk_bytes, compression),
-            "sh": write_parts(stage, "sh", sh, 48 * SH_DTYPES[sh_dtype].itemsize, chunk_bytes, compression,
+            "geometry": write_parts(stage, "geometry", geometry, 48, chunk_bytes, compression),
+            "sh": write_parts(stage, "sh", sh, 48*SH_DTYPES[sh_dtype].itemsize, chunk_bytes, compression,
                               shuffle_bytes=SH_DTYPES[sh_dtype].itemsize),
-            "bvh": write_parts(stage, "bvh", nodes, 32, chunk_bytes, compression),
         }
         set_sh_precision_metadata(manifest, sh_dtype)
-        (stage / "manifest.json").write_text(json.dumps(manifest, indent=2, ensure_ascii=False, allow_nan=False) + "\n")
-        output.mkdir(exist_ok=True)
-        new_parts = {part["path"] for buffer in manifest["files"].values() for part in buffer["parts"]}
+        (stage / "manifest.json").write_text(json.dumps(manifest, indent=2, ensure_ascii=False, allow_nan=False)+"\n")
+        # Existing sidecars (including manual alignment) are untouched.
+        output.mkdir(exist_ok=overwrite)
+        new_parts = {p["path"] for spec in manifest["files"].values() for p in spec["parts"]}
         for name in sorted(new_parts):
-            shutil.move(str(stage / name), str(output / name))
-        for name in old_parts - new_parts:
-            (output / name).unlink(missing_ok=True)
-        shutil.move(str(stage / "manifest.json"), str(output / "manifest.json"))
+            os.replace(stage/name, output/name)
+        for name in old_parts-new_parts:
+            (output/name).unlink(missing_ok=True)
+        os.replace(stage/"manifest.json", output/"manifest.json")
     return manifest
 
 
 def main(argv=None):
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--checkpoint", type=Path, required=True, help="Trusted local .pt checkpoint")
+    parser.add_argument("--checkpoint", type=Path, required=True)
     parser.add_argument("--out-dir", type=Path, required=True)
-    parser.add_argument("--camera-json", type=Path, help="Optional existing WebViewer/3DGS camera JSON")
-    parser.add_argument("--data-path", type=Path, help="Override dataset path used to read COLMAP poses")
+    parser.add_argument("--camera-json", type=Path)
+    parser.add_argument("--data-path", type=Path)
     parser.add_argument("--fov-deg", type=float, default=70)
-    parser.add_argument("--leaf-size", type=int, default=8)
-    parser.add_argument("--bvh-method", choices=("sah", "median"), default="sah")
-    parser.add_argument("--sah-bins", type=int, default=12)
     parser.add_argument("--chunk-mib", type=float, default=64)
-    parser.add_argument("--compression", choices=COMPRESSION_MODES, default="gzip-shuffle",
-                        help="Lossless transport encoding (default: gzip-shuffle), applied after any requested SH dtype conversion")
-    parser.add_argument("--sh-dtype", choices=tuple(SH_DTYPES), default="float32",
-                        help="SH storage dtype (default: float32); float16 explicitly quantizes SH only")
+    parser.add_argument("--compression", choices=COMPRESSION_MODES, default="gzip-shuffle")
+    parser.add_argument("--sh-dtype", choices=tuple(SH_DTYPES), default="float16",
+                        help="float16 quantizes SH only; float32 keeps full SH precision")
     parser.add_argument("--overwrite", action="store_true")
     args = parser.parse_args(argv)
     if not 0 < args.chunk_mib < 100:
-        parser.error("chunk-mib must be greater than 0 and below 100")
-    checkpoint = load_checkpoint(args.checkpoint)
-    manifest = export_checkpoint(
-        checkpoint, args.out_dir, source_name=args.checkpoint.name,
-        leaf_size=args.leaf_size, chunk_bytes=int(args.chunk_mib * 1024 * 1024),
-        bvh_method=args.bvh_method, sah_bins=args.sah_bins,
-        camera_json=args.camera_json, data_path=args.data_path,
-        fov_y=math.radians(args.fov_deg), overwrite=args.overwrite,
-        compression=args.compression, sh_dtype=args.sh_dtype,
-    )
-    summary = {key: manifest[key] for key in ("gaussian_count", "bvh_node_count", "bvh_max_depth")}
-    summary["manifest"] = str(args.out_dir / "manifest.json")
-    summary["total_binary_bytes"] = sum(item["byteLength"] for item in manifest["files"].values())
-    summary["total_download_bytes"] = sum(item["downloadByteLength"] for item in manifest["files"].values())
-    summary["decoded_bytes"] = summary["total_binary_bytes"]
-    summary["stored_bytes"] = summary["total_download_bytes"]
-    summary["compression_ratio"] = summary["decoded_bytes"] / summary["stored_bytes"]
-    summary["saved_percent"] = 100 * (1 - summary["stored_bytes"] / summary["decoded_bytes"])
-    summary["sh_dtype"] = manifest["files"]["sh"]["dtype"]
-    summary["bvh_method"] = manifest["bvh_method"]
-    summary["bvh_stats"] = manifest["bvh_stats"]
-    print(json.dumps(summary, indent=2))
+        parser.error("chunk-mib must be positive and less than 100")
+    manifest = export_checkpoint(load_checkpoint(args.checkpoint), args.out_dir, source_name=args.checkpoint.name,
+                                 chunk_bytes=int(args.chunk_mib*1024*1024), camera_json=args.camera_json,
+                                 data_path=args.data_path, fov_y=math.radians(args.fov_deg), overwrite=args.overwrite,
+                                 compression=args.compression, sh_dtype=args.sh_dtype)
+    decoded = sum(spec["byteLength"] for spec in manifest["files"].values())
+    stored = sum(spec["downloadByteLength"] for spec in manifest["files"].values())
+    print(json.dumps({"manifest": str(args.out_dir/"manifest.json"), "gaussian_count": manifest["gaussian_count"],
+                      "sh_dtype": manifest["files"]["sh"]["dtype"], "decoded_bytes": decoded,
+                      "stored_bytes": stored, "compression_saved_percent": 100*(1-stored/decoded)}, indent=2))
 
 
 if __name__ == "__main__":
