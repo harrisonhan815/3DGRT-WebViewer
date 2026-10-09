@@ -181,17 +181,41 @@ void main() {
 }`;
 const RESOLVE_FRAGMENT = `#version 300 es
 precision highp float;
+precision highp int;
 uniform highp sampler2D u_image;
 uniform vec3 u_background;
 uniform vec2 u_size;
 uniform int u_projection;
+uniform vec2 u_sourceSize;
+uniform vec2 u_sourcePrincipal;
+uniform float u_focal;
 in vec2 uv;
 out vec4 color;
+vec4 sourcePixel(ivec2 pixel) {
+  return texelFetch(u_image,clamp(pixel,ivec2(0),ivec2(u_sourceSize)-1),0);
+}
+vec4 perspectiveSample() {
+  // A perspective output ray samples the continuous equidistant image.
+  // Crop coordinates and principal points use pixel-edge conventions; GL
+  // texture rows run upwards, while the camera's y axis points downwards.
+  vec2 ray=vec2(uv.x-0.5,0.5-uv.y)*u_size/u_focal;
+  float radius=length(ray);
+  float scale=radius>1e-8?atan(radius)/radius:1.0;
+  vec2 edge=u_focal*scale*ray+u_sourcePrincipal;
+  vec2 texel=vec2(edge.x,u_sourceSize.y-edge.y)-0.5;
+  ivec2 lo=ivec2(floor(texel));
+  vec2 fraction=fract(texel);
+  // Explicit filtering also works for RGBA32F without requiring
+  // OES_texture_float_linear. Interpolate premultiplied color and alpha
+  // before the background and the single final UNORM conversion.
+  return mix(mix(sourcePixel(lo),sourcePixel(lo+ivec2(1,0)),fraction.x),
+             mix(sourcePixel(lo+ivec2(0,1)),sourcePixel(lo+ivec2(1,1)),fraction.x),fraction.y);
+}
 void main() {
   if (u_projection == 1 && length((uv-0.5)*u_size)>min(u_size.x,u_size.y)*0.5) {
     color=vec4(0.0,0.0,0.0,1.0); return;
   }
-  vec4 splats=texture(u_image,uv);
+  vec4 splats=u_projection==2?perspectiveSample():texture(u_image,uv);
   color=vec4(splats.rgb+(1.0-splats.a)*u_background,1.0);
 }`;
 
@@ -204,6 +228,20 @@ function copyCamera(camera) {
   if (!camera || !(camera.tanHalfFovY > 0) || !Number.isFinite(camera.tanHalfFovY)) throw new Error('Invalid camera field of view.');
   return {position:vector(camera.position,'position'),right:vector(camera.right,'right'),
     down:vector(camera.down,'down'),forward:vector(camera.forward,'forward'),tanHalfFovY:camera.tanHalfFovY};
+}
+function renderSource(width,height,camera,projection) {
+  const focal=projection===1?Math.min(width,height)/Math.PI:height/(2*camera.tanHalfFovY);
+  if(!Number.isFinite(focal)||focal<=0||focal>3.402823466e38) throw new Error('Camera focal length is outside the supported range.');
+  let sourceWidth=width,sourceHeight=height;
+  if(projection===2) {
+    // The extrema of each equidistant coordinate over the perspective
+    // rectangle lie on the corresponding axis. Two pixels on each side
+    // retain both bilinear taps even at the output image's outer edge.
+    sourceWidth=Math.ceil(2*focal*Math.atan(width/(2*focal)))+4;
+    sourceHeight=Math.ceil(2*focal*Math.atan(height/(2*focal)))+4;
+  }
+  return {width:sourceWidth,height:sourceHeight,focal,
+    principal:[sourceWidth/2,sourceHeight/2],projection};
 }
 export function shStorageFormat(metadata = {}) {
   const file=metadata.files?.sh;
@@ -412,13 +450,18 @@ export class WebGlSplatRenderer {
     }
     return {texture,fbo};
   }
-  _target(width,height,previous) {
+  _target(width,height,previous,source) {
     if(!Number.isInteger(width)||!Number.isInteger(height)||width<1||height<1||
       width>this.limits.maxTextureSize||height>this.limits.maxTextureSize) throw new Error('Invalid render dimensions.');
-    if(previous?.width===width&&previous?.height===height) return previous;
-    const gl=this.gl,next={width,height};
+    if(!Number.isInteger(source.width)||!Number.isInteger(source.height)||source.width<1||source.height<1||
+      source.width>this.limits.maxTextureSize||source.height>this.limits.maxTextureSize) throw new Error('The fisheye render crop exceeds this device\'s texture limit.');
+    if(previous?.width===width&&previous?.height===height&&previous.source.width===source.width&&
+      previous.source.height===source.height&&previous.accumulation===this.accumulation) {
+      previous.source=source; return previous;
+    }
+    const gl=this.gl,next={width,height,source,accumulation:this.accumulation};
     try {
-      next.accum=this._attachment(width,height,this.accumulation==='float32'?gl.RGBA32F:this.accumulation==='float16'?gl.RGBA16F:gl.RGBA8,
+      next.accum=this._attachment(source.width,source.height,this.accumulation==='float32'?gl.RGBA32F:this.accumulation==='float16'?gl.RGBA16F:gl.RGBA8,
         this.accumulation==='float32'?gl.FLOAT:this.accumulation==='float16'?gl.HALF_FLOAT:gl.UNSIGNED_BYTE);
       next.resolved=this._attachment(width,height,gl.RGBA8,gl.UNSIGNED_BYTE);
       this._checkError('render target allocation');
@@ -426,9 +469,9 @@ export class WebGlSplatRenderer {
     this._destroyTarget(previous); return next;
   }
   _draw(target,camera,projection,present) {
-    const gl=this.gl,{width,height}=target,r=this.model.metadata.render||{},u=this.ewa.uniforms;
+    const gl=this.gl,{width,height,source}=target,r=this.model.metadata.render||{},u=this.ewa.uniforms;
     gl.bindFramebuffer(gl.FRAMEBUFFER,target.accum.fbo);
-    gl.viewport(0,0,width,height); gl.clearColor(0,0,0,0); gl.clear(gl.COLOR_BUFFER_BIT);
+    gl.viewport(0,0,source.width,source.height); gl.clearColor(0,0,0,0); gl.clear(gl.COLOR_BUFFER_BIT);
     gl.enable(gl.BLEND); gl.blendEquation(gl.FUNC_ADD); gl.blendFuncSeparate(gl.ONE_MINUS_DST_ALPHA,gl.ONE,gl.ONE_MINUS_DST_ALPHA,gl.ONE);
     gl.useProgram(this.ewa.program); gl.bindVertexArray(this.model.vao);
     gl.activeTexture(gl.TEXTURE0); gl.bindTexture(gl.TEXTURE_2D,this.model.geometry.texture);
@@ -436,9 +479,9 @@ export class WebGlSplatRenderer {
     gl.uniform1i(u.u_geometry,0); gl.uniform1i(u.u_sh,1);
     gl.uniform1i(u.u_geometryWidth,this.model.geometry.width); gl.uniform1i(u.u_shWidth,this.model.sh.width);
     for(const name of ['position','right','down','forward']) gl.uniform3fv(u[`u_${name}`],camera[name]);
-    const fy=projection?Math.min(width,height)/Math.PI:height/(2*camera.tanHalfFovY);
-    gl.uniform2f(u.u_size,width,height); gl.uniform2f(u.u_focal,fy,fy);
-    gl.uniform2f(u.u_principal,width/2,height/2); gl.uniform2f(u.u_tanFov,width/(2*fy),height/(2*fy));
+    const fy=source.focal;
+    gl.uniform2f(u.u_size,source.width,source.height); gl.uniform2f(u.u_focal,fy,fy);
+    gl.uniform2fv(u.u_principal,source.principal); gl.uniform2f(u.u_tanFov,source.width/(2*fy),source.height/(2*fy));
     gl.uniform1f(u.u_near,r.near_plane??.01); gl.uniform1f(u.u_lowPass,r.low_pass_variance??.3);
     gl.uniform1f(u.u_minAlpha,r.min_alpha??1/255); gl.uniform1f(u.u_maxAlpha,r.max_alpha??.99);
     gl.uniform1i(u.u_projection,projection); gl.uniform1i(u.u_degree,r.sh_degree??3);
@@ -446,11 +489,14 @@ export class WebGlSplatRenderer {
     gl.drawArraysInstanced(gl.TRIANGLE_STRIP,0,4,this.model.count);
     gl.disable(gl.BLEND); gl.bindVertexArray(this.emptyVao);
     gl.bindFramebuffer(gl.FRAMEBUFFER,target.resolved.fbo);
+    gl.viewport(0,0,width,height);
     gl.useProgram(this.resolve.program);
     const v=this.resolve.uniforms;
     gl.activeTexture(gl.TEXTURE0); gl.bindTexture(gl.TEXTURE_2D,target.accum.texture);
     gl.uniform1i(v.u_image,0); gl.uniform3fv(v.u_background,r.background??[0,0,0]);
     gl.uniform2f(v.u_size,width,height); gl.uniform1i(v.u_projection,projection);
+    gl.uniform2f(v.u_sourceSize,source.width,source.height); gl.uniform2fv(v.u_sourcePrincipal,source.principal);
+    gl.uniform1f(v.u_focal,source.focal);
     gl.drawArrays(gl.TRIANGLES,0,3);
     if(present) {
       gl.bindFramebuffer(gl.READ_FRAMEBUFFER,target.resolved.fbo);
@@ -483,10 +529,13 @@ export class WebGlSplatRenderer {
       poll();
     });
   }
-  async _frame({width,height,camera,previewCanvas=null,measureGpu=true}) {
+  async _frame({width,height,camera,previewCanvas=null,measureGpu=true,projection='fisheye-perspective'}) {
     this._assertAlive();
     if(!this.model) throw new Error('Load a model before rendering.');
     if(this.rendering) throw new Error('Only one WebGL frame may be in flight.');
+    if(!['fisheye-perspective','pinhole'].includes(projection)) throw new Error(`Unsupported output projection: ${projection}.`);
+    const projectionCode=previewCanvas?1:projection==='pinhole'?0:2;
+    const source=renderSource(width,height,camera,projectionCode);
     this.rendering=true;
     const start=performance.now();
     let query=null;
@@ -495,15 +544,15 @@ export class WebGlSplatRenderer {
       this._assertAlive();
       let target;
       if(previewCanvas) {
-        this.previewTarget=this._target(width,height,this.previewTarget); target=this.previewTarget;
+        this.previewTarget=this._target(width,height,this.previewTarget,source); target=this.previewTarget;
       } else {
-        this.target=this._target(width,height,this.target); target=this.target;
+        this.target=this._target(width,height,this.target,source); target=this.target;
         if(this.canvas.width!==width||this.canvas.height!==height) { this.canvas.width=width; this.canvas.height=height; }
         this.width=width; this.height=height;
       }
       const gl=this.gl;
       if(this.timer&&measureGpu) { query=gl.createQuery(); this._queries.add(query); gl.beginQuery(this.timer.TIME_ELAPSED_EXT,query); }
-      try { this._draw(target,camera,previewCanvas?1:0,!previewCanvas); }
+      try { this._draw(target,camera,projectionCode,!previewCanvas); }
       finally { if(query) gl.endQuery(this.timer.TIME_ELAPSED_EXT); }
       await this._fence();
       this._assertAlive();
@@ -516,17 +565,19 @@ export class WebGlSplatRenderer {
         if(previewCanvas.width!==width||previewCanvas.height!==height) { previewCanvas.width=width; previewCanvas.height=height; }
         context.putImageData(new ImageData(new Uint8ClampedArray(rgba.buffer),width,height),0,0);
       }
-      return {renderMs:performance.now()-start,sortMs,gpuMs,mode:'webgl2-ewa',accumulation:this.accumulation};
+      return {renderMs:performance.now()-start,sortMs,gpuMs,mode:'webgl2-ewa',accumulation:this.accumulation,
+        projection:previewCanvas?'fisheye':projection,sourceWidth:source.width,sourceHeight:source.height,
+        sourceFocal:source.focal,sourcePrincipal:[...source.principal]};
     } finally {
       if(query&&this._queries.delete(query)) this.gl.deleteQuery(query);
       this.rendering=false;
     }
   }
-  render({width,height,measureGpu=true}) {
+  render({width,height,measureGpu=true,projection='fisheye-perspective'}) {
     this._assertAlive();
     if(this.rendering) throw new Error('Only one WebGL frame may be in flight.');
     const camera=copyCamera(this.camera);
-    const result=this._frame({width,height,camera,measureGpu});
+    const result=this._frame({width,height,camera,measureGpu,projection});
     this.pendingFrame=result; return result;
   }
   renderPreview(canvas,{width=192,height=192,camera,measureGpu=true}) {
