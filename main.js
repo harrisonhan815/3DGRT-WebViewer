@@ -251,8 +251,8 @@ function applyPreset(index) {
   updateGizmo();
 }
 
-async function fetchJson(url, signal) {
-  const res = await fetch(url, { signal, credentials: 'omit' });
+async function fetchJson(url, signal, cache = 'default') {
+  const res = await fetch(url, { signal, credentials: 'omit', cache });
   if (!res.ok) throw new Error(`${res.status}: ${url}`);
   return res.json();
 }
@@ -700,7 +700,6 @@ async function frame(time) {
 }
 
 async function main() {
-  if (!isSecureContext) throw new Error('请通过 HTTPS 或 localhost 打开，以便后台加载和校验模型文件。');
   rendererInitialization = WebGlSplatRenderer.create(canvas);
   renderer = await rendererInitialization;
   if (stopped) { renderer.dispose(); return; }
@@ -718,10 +717,18 @@ async function main() {
     defaultId = 'external';
   } else {
     loadController = new AbortController();
-    const data = await fetchJson(new URL('./models.json', document.baseURI), loadController.signal);
+    const catalogPath = params.get('catalog') || document.querySelector('meta[name="viewer-model-catalog"]')?.content || './models.json';
+    const catalogUrl = new URL(catalogPath, document.baseURI);
+    const data = await fetchJson(catalogUrl, loadController.signal, 'no-store');
     if (stopped) return;
     catalog = data.models;
-    if (!Array.isArray(catalog) || !catalog.length) throw new Error('models.json 中没有模型，请先导出 WebGL2 模型并生成模型列表');
+    if (!Array.isArray(catalog) || !catalog.length) throw new Error(`${catalogUrl.pathname} 中没有模型，请先导出 WebGL2 模型并生成模型列表`);
+    catalog = catalog.map(entry => {
+      if (!entry || typeof entry.id !== 'string' || !entry.id.trim() || typeof entry.url !== 'string' || !entry.url.trim()) {
+        throw new Error('模型列表中的每项都需要 id 和 url');
+      }
+      return {...entry, url: new URL(entry.url, catalogUrl).href};
+    });
     defaultId = params.get('model') || data.default || catalog[0].id;
   }
   $('model').replaceChildren(...catalog.map((entry) => new Option(entry.name || entry.id, entry.id)));

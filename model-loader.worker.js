@@ -1,4 +1,5 @@
 import {validateFile} from './model-loader.js';
+import {sha256Hex} from './sha256.js';
 
 const gzipMagic = data => data.length >= 3 && data[0] === 0x1f && data[1] === 0x8b && data[2] === 8;
 const expectedDownload = part => part.downloadByteLength ?? part.byteLength;
@@ -74,9 +75,7 @@ async function restoreAndCheck(bytes,part,destination) {
     }
   } else destination.set(bytes);
   if (part.sha256 !== undefined) {
-    if (!globalThis.crypto?.subtle) throw new Error('模型校验需要 HTTPS 或 localhost');
-    const digest = new Uint8Array(await crypto.subtle.digest('SHA-256',destination));
-    const hex = Array.from(digest,v=>v.toString(16).padStart(2,'0')).join('');
+    const hex = await sha256Hex(destination);
     if (hex !== part.sha256) throw new Error('模型解压后 SHA256 校验失败');
   }
 }

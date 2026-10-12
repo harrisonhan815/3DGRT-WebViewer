@@ -1,5 +1,5 @@
 {
-  "default": "fc-room1-multifov-pruned",
+  "default": "zj-office1",
   "models": [
     {
       "id": "fc-room1-multifov-pruned",
@@ -11,6 +11,12 @@
       "id": "fc-lounge-multifov-pruned",
       "name": "lounge",
       "url": "https://models.hhds-us01.xyz/models/fc-lounge-multifov-pruned/manifest.json",
+      "output_projection": "pinhole"
+    },
+    {
+      "id": "zj-office1",
+      "name": "office1",
+      "url": "https://models.hhds-us01.xyz/models/zj-office1/manifest.json",
       "output_projection": "pinhole"
     }
   ]

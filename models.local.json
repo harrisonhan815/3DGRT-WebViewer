@@ -1,0 +1,35 @@
+{
+  "default": "fc-room1-multifov-pruned",
+  "models": [
+    {
+      "id": "fc-room1-multifov-pruned",
+      "name": "room1",
+      "url": "models/fc-room1-multifov-pruned/manifest.json",
+      "output_projection": "pinhole"
+    },
+    {
+      "id": "fc-lounge-multifov-pruned",
+      "name": "lounge",
+      "url": "models/fc-lounge-multifov-pruned/manifest.json",
+      "output_projection": "pinhole"
+    },
+    {
+      "id": "zj-office1",
+      "name": "office1",
+      "url": "models/zj-office1/manifest.json",
+      "output_projection": "pinhole"
+    },
+    {
+      "id": "fc-room1-pinhole-trial",
+      "name": "room1 · 针孔监督试验",
+      "url": "models/fc-room1-pinhole-trial/manifest.json",
+      "output_projection": "pinhole"
+    },
+    {
+      "id": "fc-room1-webgl2",
+      "name": "room1 · 早期鱼眼版",
+      "url": "models/fc-room1-webgl2/manifest.json",
+      "output_projection": "fisheye-perspective"
+    }
+  ]
+}
