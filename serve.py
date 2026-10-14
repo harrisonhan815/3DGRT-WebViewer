@@ -31,6 +31,7 @@ MODEL_SCHEMAS = (MODEL_SCHEMA, "fullcircle-webgl2-ewa-v1")
 MAX_BODY_BYTES = 16 * 1024
 MAX_MANIFEST_BYTES = 16 * 1024 * 1024
 DEFAULT_DIRECTORY = Path(__file__).resolve().parent
+UNCACHED_SUFFIXES = {".html", ".htm", ".js", ".mjs", ".css", ".json", ".wgsl"}
 
 
 class RequestError(ValueError):
@@ -367,8 +368,13 @@ class ViewerHandler(SimpleHTTPRequestHandler):
             elif destination.name in ("index.html", "index.htm") and destination.is_file():
                 self._serve_index(destination)
                 return
-            if destination.name == "alignment.json" and "If-Modified-Since" in self.headers:
-                del self.headers["If-Modified-Since"]
+            if destination.suffix.lower() in UNCACHED_SUFFIXES:
+                # Source files can change within one HTTP timestamp second.
+                # Always send fresh code/metadata, including worker modules;
+                # large binary/gzip model parts retain normal cache behavior.
+                for header in ("If-Modified-Since", "If-None-Match"):
+                    if header in self.headers:
+                        del self.headers[header]
             super().do_HEAD() if head else super().do_GET()
         except RequestError as error:
             self._json_response(error.status, {"error": str(error)})
@@ -382,7 +388,9 @@ class ViewerHandler(SimpleHTTPRequestHandler):
         self._get(head=True)
 
     def end_headers(self):
-        if self.path.split("?", 1)[0].endswith("/alignment.json"):
+        path = unquote(self.path.split("?", 1)[0])
+        already_set = any(header.lower().startswith(b"cache-control:") for header in getattr(self, "_headers_buffer", []))
+        if Path(path).suffix.lower() in UNCACHED_SUFFIXES and not already_set:
             self.send_header("Cache-Control", "no-store")
         super().end_headers()
 

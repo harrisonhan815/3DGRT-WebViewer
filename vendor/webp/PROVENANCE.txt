@@ -1,0 +1,5 @@
+Unmodified decoder subset of @jsquash/webp 1.5.0.
+Source: https://github.com/jamsinclair/jSquash/tree/main/packages/webp
+Pinned npm source/integrity: 3DGRT-WebViewer/tools/sog/package-lock.json in the FullCircle checkout
+Apache-2.0 wrapper; codec licenses in codec/LICENSE.codec.md.
+Numeric SOG textures require raw RGBA, without canvas alpha premultiplication.

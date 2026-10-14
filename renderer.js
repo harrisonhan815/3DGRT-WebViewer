@@ -339,7 +339,7 @@ export class WebGlSplatRenderer {
     }
     if(count*12>this.limits.maxTexturePixels) throw new Error(`SH texture exceeds this device's ${this.limits.maxTextureSize}² texture limit.`);
     const render=metadata.render||{};
-    if(render.depth_sort!==undefined&&render.depth_sort!=='radial') throw new Error('This model requires unsupported non-radial sorting.');
+    if(render.depth_sort!==undefined&&!['radial','camera'].includes(render.depth_sort)) throw new Error('This model requires unsupported sorting.');
     if(render.sh_degree!==undefined&&(!Number.isInteger(render.sh_degree)||render.sh_degree<0||render.sh_degree>3)) throw new Error('SH degree must be between 0 and 3.');
     if(render.kernel_degree!==undefined&&render.kernel_degree!==2) throw new Error('Only the quadratic 3DGS Gaussian kernel is supported.');
     if(render.sh_direction!==undefined&&render.sh_direction!=='camera_to_gaussian') throw new Error('Unsupported SH direction.');
@@ -366,6 +366,14 @@ export class WebGlSplatRenderer {
     try { this._checkError('model texture upload'); return {texture,width,height}; }
     catch(error) { gl.deleteTexture(texture); throw error; }
   }
+  unloadModel() {
+    this._assertAlive();
+    if(this.rendering) throw new Error('Wait for the current frame before unloading a model.');
+    this._rejectSort(abortError()); this.worker?.terminate(); this.worker=null;
+    this._destroyModel(this.model); this.model=null;
+    this.sortedKey=null; this.sortFailure=null;
+    this._destroyTarget(this.previewTarget); this.previewTarget=null;
+  }
   async loadModel({geometry,sh,metadata}) {
     this._assertAlive();
     if(this.rendering) throw new Error('Wait for the current frame before loading a model.');
@@ -391,7 +399,7 @@ export class WebGlSplatRenderer {
       gl.enableVertexAttribArray(0); gl.vertexAttribIPointer(0,1,gl.UNSIGNED_INT,0,0); gl.vertexAttribDivisor(0,1);
       gl.bindVertexArray(null);
       this._checkError('model upload');
-      worker=new Worker(new URL('./sort-worker.js',import.meta.url),{type:'module'});
+      worker=new Worker(new URL('./sort-worker.js?v=20261013-lazy-hud-1',import.meta.url),{type:'module'});
       const generation=this.generation+1;
       worker.onmessage=event=>this._sortMessage(event.data);
       worker.onerror=event=>{
@@ -403,7 +411,7 @@ export class WebGlSplatRenderer {
       this._assertAlive();
       this._rejectSort(abortError()); this.worker?.terminate();
       this._destroyModel(this.model); this.model=next; this.worker=worker; this.generation=generation;
-      this.sortedPosition=null; this.lastSortMs=0; this.sortFailure=null;
+      this.sortedKey=null; this.lastSortMs=0; this.sortFailure=null;
       this._destroyTarget(this.previewTarget); this.previewTarget=null;
     } catch(error) { worker?.terminate(); this._destroyModel(next); throw error; }
   }
@@ -419,19 +427,20 @@ export class WebGlSplatRenderer {
     const gl=this.gl;
     gl.bindBuffer(gl.ARRAY_BUFFER,this.model.indexBuffer);
     gl.bufferSubData(gl.ARRAY_BUFFER,0,new Uint32Array(data.order));
-    this.sortedPosition=pending.position;
+    this.sortedKey=pending.key;
     this.lastSortMs=data.sortMs;
     pending.resolve(data.sortMs);
   }
-  async _sort(position) {
+  async _sort(camera,mode) {
     if(this.sortFailure) throw this.sortFailure;
-    const p=position.map(Math.fround);
-    if(this.sortedPosition?.every((value,i)=>value===p[i])) return 0;
+    const p=camera.position.map(Math.fround),forward=mode==='camera'?camera.forward.map(Math.fround):null;
+    const key=[mode,...p,...(forward??[])];
+    if(this.sortedKey?.length===key.length&&this.sortedKey.every((value,i)=>value===key[i])) return 0;
     if(this.sortPending) throw new Error('Another depth sort is already pending.');
     const requestId=++this.requestId;
     return new Promise((resolve,reject)=>{
-      this.sortPending={requestId,position:p,resolve,reject};
-      this.worker.postMessage({type:'sort',generation:this.generation,requestId,position:p});
+      this.sortPending={requestId,key,resolve,reject};
+      this.worker.postMessage({type:'sort',generation:this.generation,requestId,position:p,forward,mode});
     });
   }
   _attachment(width,height,internalFormat,type) {
@@ -529,18 +538,20 @@ export class WebGlSplatRenderer {
       poll();
     });
   }
-  async _frame({width,height,camera,previewCanvas=null,measureGpu=true,projection='fisheye-perspective'}) {
+  async _frame({width,height,camera,previewCanvas=null,measureGpu=true,projection='fisheye-perspective',sortMode}) {
     this._assertAlive();
     if(!this.model) throw new Error('Load a model before rendering.');
     if(this.rendering) throw new Error('Only one WebGL frame may be in flight.');
     if(!['fisheye-perspective','pinhole'].includes(projection)) throw new Error(`Unsupported output projection: ${projection}.`);
+    sortMode=sortMode??this.model.metadata.render?.depth_sort??'radial';
+    if(!['radial','camera'].includes(sortMode)) throw new Error(`Unsupported sorting: ${sortMode}.`);
     const projectionCode=previewCanvas?1:projection==='pinhole'?0:2;
     const source=renderSource(width,height,camera,projectionCode);
     this.rendering=true;
     const start=performance.now();
     let query=null;
     try {
-      const sortMs=await this._sort(camera.position);
+      const sortMs=await this._sort(camera,sortMode);
       this._assertAlive();
       let target;
       if(previewCanvas) {
@@ -565,7 +576,7 @@ export class WebGlSplatRenderer {
         if(previewCanvas.width!==width||previewCanvas.height!==height) { previewCanvas.width=width; previewCanvas.height=height; }
         context.putImageData(new ImageData(new Uint8ClampedArray(rgba.buffer),width,height),0,0);
       }
-      return {renderMs:performance.now()-start,sortMs,gpuMs,mode:'webgl2-ewa',accumulation:this.accumulation,
+      return {renderMs:performance.now()-start,sortMs,gpuMs,sortMode,mode:'webgl2-ewa',accumulation:this.accumulation,
         projection:previewCanvas?'fisheye':projection,sourceWidth:source.width,sourceHeight:source.height,
         sourceFocal:source.focal,sourcePrincipal:[...source.principal]};
     } finally {
@@ -573,17 +584,17 @@ export class WebGlSplatRenderer {
       this.rendering=false;
     }
   }
-  render({width,height,measureGpu=true,projection='fisheye-perspective'}) {
+  render({width,height,measureGpu=true,projection='fisheye-perspective',sortMode}) {
     this._assertAlive();
     if(this.rendering) throw new Error('Only one WebGL frame may be in flight.');
     const camera=copyCamera(this.camera);
-    const result=this._frame({width,height,camera,measureGpu,projection});
+    const result=this._frame({width,height,camera,measureGpu,projection,sortMode});
     this.pendingFrame=result; return result;
   }
-  renderPreview(canvas,{width=192,height=192,camera,measureGpu=true}) {
+  renderPreview(canvas,{width=192,height=192,camera,measureGpu=true,sortMode='radial'}) {
     this._assertAlive();
     if(this.rendering) throw new Error('Only one WebGL frame may be in flight.');
-    const result=this._frame({width,height,camera:copyCamera(camera??this.camera),previewCanvas:canvas,measureGpu});
+    const result=this._frame({width,height,camera:copyCamera(camera??this.camera),previewCanvas:canvas,measureGpu,sortMode});
     this.pendingFrame=result; return result;
   }
   _readTarget(target) {

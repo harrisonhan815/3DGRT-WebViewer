@@ -3,6 +3,56 @@
 // The renderer validates dtype/stride; workers restore and check those bytes.
 const MAX_PART_BYTES = 100 * 1024 * 1024;
 
+export function validateModelFiles(manifest) {
+  if (manifest.storage === undefined) {
+    const sizes = ['geometry', 'sh'].map(key => validateFile(manifest.files?.[key]));
+    return sizes.reduce((a, b) => ({decodedBytes: a.decodedBytes + b.decodedBytes, downloadBytes: a.downloadBytes + b.downloadBytes}));
+  }
+  const storage = manifest.storage, count = manifest.gaussian_count;
+  if (!storage || storage.format !== 'sog-v2' || typeof storage.path !== 'string' || !storage.path
+      || !Number.isSafeInteger(storage.byteLength) || storage.byteLength < 22 || storage.byteLength > 512 * 1024 * 1024
+      || !/^[0-9a-f]{64}$/.test(storage.sha256 ?? '') || !Number.isSafeInteger(count) || count < 1 || count > 10_000_000) throw new Error('无效 SOG 下载元数据');
+  const dtype = manifest.files?.sh?.dtype, stride = dtype === 'float16' ? 96 : dtype === 'float32' ? 192 : 0;
+  if (!stride || manifest.files?.geometry?.byteLength !== count * 48 || manifest.files.geometry.stride !== 48
+      || manifest.files.sh.byteLength !== count * stride || manifest.files.sh.stride !== stride) throw new Error('SOG 解码缓冲区大小不符');
+  return {downloadBytes: storage.byteLength, decodedBytes: count * (48 + stride)};
+}
+
+export function loadModelBuffers(manifest, base, signal, onProgress = () => {}) {
+  validateModelFiles(manifest);
+  if (manifest.storage === undefined) {
+    return Promise.all(['geometry', 'sh'].map(key => loadBuffer(manifest.files[key], base, signal, onProgress)))
+      .then(([geometry, sh]) => ({geometry, sh}));
+  }
+  return new Promise((resolve, reject) => {
+    let worker, finished = false;
+    const cleanup = () => { signal?.removeEventListener('abort', abort); worker?.terminate(); };
+    const fail = error => { if (!finished) { finished = true; cleanup(); reject(error); } };
+    const abort = () => fail(new DOMException('Model loading was cancelled.', 'AbortError'));
+    try {
+      if (signal?.aborted) { abort(); return; }
+      worker = new Worker(new URL('./model-loader.worker.js?v=20261013-lazy-hud-1', import.meta.url), {type: 'module'});
+      signal?.addEventListener('abort', abort, {once: true});
+      worker.onmessage = event => {
+        if (finished) return;
+        const message = event.data;
+        if (message.type === 'progress') {
+          try { onProgress(message.bytes); } catch (error) { fail(error); }
+        } else if (message.type === 'done') {
+          for (const key of ['geometry', 'sh']) {
+            if (!(message[key] instanceof ArrayBuffer) || message[key].byteLength !== manifest.files[key].byteLength) {
+              fail(new Error('SOG 后台解码长度错误')); return;
+            }
+          }
+          finished = true; cleanup(); resolve({geometry: message.geometry, sh: message.sh});
+        } else if (message.type === 'error') fail(new Error(message.message));
+      };
+      worker.onerror = event => { event.preventDefault(); fail(new Error(event.message || 'SOG 解码进程失败')); };
+      worker.postMessage({manifest, base: String(base)});
+    } catch (error) { fail(error); }
+  });
+}
+
 export function validateFile(file) {
   if (!file || !Number.isSafeInteger(file.byteLength) || file.byteLength <= 0 || !Array.isArray(file.parts) || !file.parts.length) throw new Error('无效模型缓冲区');
   let decoded = 0, download = 0;
@@ -39,7 +89,7 @@ export function loadBuffer(file, base, signal, onProgress = () => {}) {
       validateFile(file);
       if (signal?.aborted) { abort(); return; }
       if (typeof Worker === 'undefined') throw new Error('此浏览器不支持模型后台加载，请更新浏览器');
-      worker = new Worker(new URL('./model-loader.worker.js',import.meta.url),{type:'module'});
+      worker = new Worker(new URL('./model-loader.worker.js?v=20261013-lazy-hud-1',import.meta.url),{type:'module'});
       signal?.addEventListener('abort',abort,{once:true});
       worker.onmessage = event => {
         if (finished) return;

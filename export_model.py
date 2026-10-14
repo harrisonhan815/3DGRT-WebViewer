@@ -1,15 +1,18 @@
 #!/usr/bin/env python3
 """Export a trusted local, radial-sorted 2D-EWA 3DGS checkpoint for WebGL2.
 
-Only CPU PyTorch, NumPy and OmegaConf are needed. No CUDA/model import occurs.
-Every Gaussian is retained in checkpoint order. Geometry is FP32; the default
+Binary export needs CPU PyTorch, NumPy and OmegaConf; no CUDA/model import.
+SOG export additionally uses the pinned Node encoder and Pillow WebP decoder.
+The CLI defaults to both encodings, with shared camera/alignment metadata.
+Binary export retains checkpoint order. Geometry is FP32; the default
 SH float16 is an explicit storage quantization, followed by lossless transport.
 
 Geometry: 48 little-endian bytes per Gaussian, three float32 vec4s:
   [center.xyz, sigmoid opacity], [cov_xx,cov_xy,cov_xz,cov_yy],
   [cov_yz,cov_zz,0,0], with covariance R*diag(exp(scale)^2)*R^T.
 SH: 48 RGB-interleaved values, DC first; 96 bytes float16 or 192 bytes float32.
-No BVH, ray-tracing kernel conversion, Gaussian pruning or reordering is used.
+No BVH, ray-tracing kernel conversion or Gaussian pruning is used.
+--format sog applies SOG v2 lossy quantization and Morton ordering.
 """
 
 import argparse
@@ -474,6 +477,11 @@ def main(argv=None):
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--checkpoint", type=Path, required=True)
     parser.add_argument("--out-dir", type=Path, required=True)
+    parser.add_argument("--format", choices=("both", "bin", "sog"), default="both",
+                        help="Default both: shared manifest with compressed binary + SOG; bin/sog export only one encoding")
+    parser.add_argument("--alignment", type=Path, help="both/sog: preserve a matching alignment.json from another export")
+    parser.add_argument("--sog-gpu", default="0", help="SOG encoder GPU adapter index, or cpu (slow)")
+    parser.add_argument("--sog-iterations", type=int, default=10)
     parser.add_argument("--camera-json", type=Path)
     parser.add_argument("--data-path", type=Path)
     parser.add_argument("--fov-deg", type=float, default=70)
@@ -485,12 +493,41 @@ def main(argv=None):
     args = parser.parse_args(argv)
     if not 0 < args.chunk_mib < 100:
         parser.error("chunk-mib must be positive and less than 100")
-    manifest = export_checkpoint(load_checkpoint(args.checkpoint), args.out_dir, source_name=args.checkpoint.name,
-                                 chunk_bytes=int(args.chunk_mib*1024*1024), camera_json=args.camera_json,
-                                 data_path=args.data_path, fov_y=math.radians(args.fov_deg), overwrite=args.overwrite,
-                                 compression=args.compression, sh_dtype=args.sh_dtype)
+    if args.format == "both":
+        from export_both import export_both
+        manifest = export_both(load_checkpoint(args.checkpoint), args.out_dir, source_name=args.checkpoint.name,
+                               chunk_bytes=int(args.chunk_mib*1024*1024), camera_json=args.camera_json,
+                               data_path=args.data_path, fov_y=math.radians(args.fov_deg), overwrite=args.overwrite,
+                               compression=args.compression, sh_dtype=args.sh_dtype, alignment=args.alignment,
+                               gpu=args.sog_gpu, iterations=args.sog_iterations)
+    elif args.format == "sog":
+        from export_sog import export_sog
+        manifest = export_sog(load_checkpoint(args.checkpoint), args.out_dir, source_name=args.checkpoint.name,
+                              camera_json=args.camera_json, data_path=args.data_path,
+                              fov_y=math.radians(args.fov_deg), overwrite=args.overwrite, sh_dtype=args.sh_dtype,
+                              alignment=args.alignment, gpu=args.sog_gpu, iterations=args.sog_iterations)
+    else:
+        if args.alignment:
+            parser.error("--alignment is for --format both/sog; existing bin exports retain their own sidecars")
+        manifest = export_checkpoint(load_checkpoint(args.checkpoint), args.out_dir, source_name=args.checkpoint.name,
+                                     chunk_bytes=int(args.chunk_mib*1024*1024), camera_json=args.camera_json,
+                                     data_path=args.data_path, fov_y=math.radians(args.fov_deg), overwrite=args.overwrite,
+                                     compression=args.compression, sh_dtype=args.sh_dtype)
     decoded = sum(spec["byteLength"] for spec in manifest["files"].values())
-    stored = sum(spec["downloadByteLength"] for spec in manifest["files"].values())
+    if manifest.get("variants"):
+        sizes = {}
+        for key in ("bin", "sog"):
+            spec = manifest["variants"][key]
+            sizes[key] = {"decoded_bytes": sum(v["byteLength"] for v in spec["files"].values()),
+                          "stored_bytes": spec["storage"]["byteLength"] if spec.get("storage") else
+                          sum(v["downloadByteLength"] for v in spec["files"].values())}
+        print(json.dumps({"manifest": str(args.out_dir/"manifest.json"), "gaussian_count": manifest["gaussian_count"],
+                          "default_variant": "sog", "variants": sizes,
+                          "total_stored_bytes": sum(v["stored_bytes"] for v in sizes.values()),
+                          "alignment": str(args.out_dir/"alignment.json")}, indent=2))
+        return
+    stored = (manifest["storage"]["byteLength"] if manifest.get("storage") else
+              sum(spec["downloadByteLength"] for spec in manifest["files"].values()))
     print(json.dumps({"manifest": str(args.out_dir/"manifest.json"), "gaussian_count": manifest["gaussian_count"],
                       "sh_dtype": manifest["files"]["sh"]["dtype"], "decoded_bytes": decoded,
                       "stored_bytes": stored, "compression_saved_percent": 100*(1-stored/decoded)}, indent=2))

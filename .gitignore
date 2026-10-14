@@ -1,5 +1,7 @@
 pt/
 __pycache__/
 bak/
+docs/
 models/
-legacy-webgpu/models/
+tools/sog/node_modules/
+models-bak

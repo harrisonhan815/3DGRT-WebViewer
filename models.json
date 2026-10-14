@@ -2,21 +2,27 @@
   "default": "zj-office1",
   "models": [
     {
-      "id": "fc-room1-multifov-pruned",
-      "name": "room1",
-      "url": "https://models.hhds-us01.xyz/models/fc-room1-multifov-pruned/manifest.json",
-      "output_projection": "pinhole"
-    },
-    {
-      "id": "fc-lounge-multifov-pruned",
-      "name": "lounge",
-      "url": "https://models.hhds-us01.xyz/models/fc-lounge-multifov-pruned/manifest.json",
-      "output_projection": "pinhole"
-    },
-    {
       "id": "zj-office1",
-      "name": "office1",
+      "name": "office1 全分辨率",
       "url": "https://models.hhds-us01.xyz/models/zj-office1/manifest.json",
+      "output_projection": "pinhole"
+    },
+    {
+      "id": "zj-office1-2",
+      "name": "office1 2倍下采样",
+      "url": "https://models.hhds-us01.xyz/models/zj-office1-2/manifest.json",
+      "output_projection": "pinhole"
+    },
+    {
+      "id": "zj-office1-4",
+      "name": "office1 4倍下采样",
+      "url": "https://models.hhds-us01.xyz/models/zj-office1-4/manifest.json",
+      "output_projection": "pinhole"
+    },
+    {
+      "id": "zj-office1-insta",
+      "name": "office1 官方生成",
+      "url": "https://models.hhds-us01.xyz/models/zj-office1-insta/manifest.json",
       "output_projection": "pinhole"
     }
   ]

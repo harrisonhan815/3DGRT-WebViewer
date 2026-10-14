@@ -1,5 +1,5 @@
-import {validateFile} from './model-loader.js';
-import {sha256Hex} from './sha256.js';
+import {validateFile, validateModelFiles} from './model-loader.js?v=20261013-lazy-hud-1';
+import {sha256Hex} from './sha256.js?v=20261013-lazy-hud-1';
 
 const gzipMagic = data => data.length >= 3 && data[0] === 0x1f && data[1] === 0x8b && data[2] === 8;
 const expectedDownload = part => part.downloadByteLength ?? part.byteLength;
@@ -105,6 +105,24 @@ async function decodePart(bytes,part,destination) {
 
 self.onmessage = async event => {
   try {
+    if (event.data.manifest !== undefined) {
+      const {manifest, base} = event.data;
+      validateModelFiles(manifest);
+      const spec = manifest.storage;
+      let reported = 0;
+      const progress = count => {
+        const next = Math.max(reported, Math.min(spec.byteLength, Math.floor(count)));
+        if (next > reported) self.postMessage({type: 'progress', bytes: next - reported});
+        reported = next;
+      };
+      const bytes = await readPart(spec, base, progress);
+      if (await sha256Hex(bytes) !== spec.sha256) throw new Error('SOG SHA256 校验失败');
+      const {decodeSog} = await import('./sog-decoder.js?v=20261013-lazy-hud-1');
+      const {geometry, sh} = await decodeSog(bytes, manifest);
+      progress(spec.byteLength);
+      self.postMessage({type: 'done', geometry, sh}, [geometry, sh]);
+      return;
+    }
     const {file,base} = event.data;
     validateFile(file);
     const result = new Uint8Array(file.byteLength);

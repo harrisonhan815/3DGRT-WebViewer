@@ -1,9 +1,10 @@
-import { WebGlSplatRenderer } from './renderer.js';
-import { AdaptiveResolution } from './adaptive-resolution.js';
-import { createFrameAlignment, frameFromAlignment, defaultFrame, applyAlignment, alignmentUp, loadAlignment, ALIGNMENT_SCHEMA } from './alignment.js';
-import { AlignmentGizmo } from './alignment-gizmo.js';
-import { loadBuffer, validateFile } from './model-loader.js';
-import { FlightControls } from './flight-controls.js';
+import { WebGlSplatRenderer } from './renderer.js?v=20261013-lazy-hud-1';
+import { AdaptiveResolution } from './adaptive-resolution.js?v=20261013-lazy-hud-1';
+import { createFrameAlignment, frameFromAlignment, defaultFrame, applyAlignment, alignmentUp, loadAlignment, ALIGNMENT_SCHEMA } from './alignment.js?v=20261013-lazy-hud-1';
+import { AlignmentGizmo } from './alignment-gizmo.js?v=20261013-lazy-hud-1';
+import { validateModelFiles } from './model-loader.js?v=20261013-lazy-hud-1';
+import { ModelVariants, VARIANT_LABELS } from './model-variants.js?v=20261013-lazy-hud-1';
+import { FlightControls } from './flight-controls.js?v=20261013-lazy-hud-1';
 
 const $ = (id) => document.getElementById(id);
 const DEFAULT_FOV_DEG = 90;
@@ -12,6 +13,9 @@ const previewCanvas = $('fisheye-view');
 let renderer, manifest, camera, worldUp, ready = false, loading = false, dirty = true, rendered = false;
 let catalog = [], currentId = '', loadController, busy = false, capturing = false, baseSpeed = 1;
 let activeProjection = 'fisheye-perspective';
+let activeEntry = null;
+const activeCompatibility = false;
+let variants = null, activeVariant = '';
 let flightControls = null;
 let frameTimes = [], previousFrame = 0, lastUiUpdate = 0;
 let stopped = false, animationFrame = null;
@@ -52,12 +56,14 @@ function haltViewer() {
   if (stopped) return;
   stopped = true;
   ready = false;
+  updateFpsHud(null, 'stopped', '已停止');
   keys.clear();
   clearPointerState();
   flightControls?.dispose();
   if (animationFrame !== null) cancelAnimationFrame(animationFrame);
   animationFrame = null;
   loadController?.abort();
+  variants?.dispose(); variants = null;
   alignmentSaveController?.abort();
   gizmo.dispose();
 }
@@ -104,6 +110,8 @@ async function safeExit() {
       camera = null;
       worldUp = null;
       catalog = [];
+      activeEntry = null;
+      activeVariant = '';
       frameTimes = [];
       $('model').replaceChildren();
       $('camera').replaceChildren();
@@ -164,6 +172,13 @@ function message(error) {
   $('error').hidden = false;
 }
 
+function updateFpsHud(fps, state = 'rendering', label = '主画面') {
+  const value = Number.isFinite(fps) ? `${fps.toFixed(1)} FPS` : '— FPS';
+  if ($('fps-value').textContent !== value) $('fps-value').textContent = value;
+  if ($('fps-state').textContent !== label) $('fps-state').textContent = label;
+  $('fps-hud').dataset.state = state;
+}
+
 function markCameraChanged(moving = false) {
   cameraRevision++;
   dirty = true;
@@ -199,6 +214,7 @@ function updateAlignmentControls() {
   for (const id of ['align-tool','align-enabled','align-center','align-reset','align-save']) {
     $(id).disabled = !ready || loading || stopped || alignmentSaving || calibrationDragging;
   }
+  updateVariantControls();
   updateGizmo();
 }
 
@@ -271,9 +287,9 @@ function validateManifest(m) {
   }
   if (!Array.isArray(m.cameras) || !m.cameras.length) throw new Error('模型缺少初始相机');
   const storage = shStorageFormat(m);
+  validateModelFiles(m);
   for (const key of ['geometry', 'sh']) {
     const file = m.files?.[key];
-    validateFile(file);
     const stride = key === 'geometry' ? 48 : storage.stride;
     if (!Number.isSafeInteger(m.gaussian_count) || m.gaussian_count < 1
         || file.byteLength !== m.gaussian_count * stride
@@ -292,11 +308,99 @@ function modelProjection(entry) {
   return projection;
 }
 
+function updateCompatibilityControls() {
+  $('compatibility-control').hidden = true;
+  $('compatibility').checked = false;
+  $('compatibility').disabled = true;
+}
+
+function updateVariantControls() {
+  $('variant-controls').hidden = !variants || variants.entries.size < 2;
+  const notes = [];
+  for (const key of ['sog', 'bin']) {
+    const entry = variants?.entries.get(key), button = $(`variant-${key}`);
+    button.setAttribute('aria-pressed', String(activeVariant === key));
+    button.disabled = !ready || loading || stopped || capturing || alignmentSaving || calibrationDragging || !entry
+      || entry.status === 'loading' || key === activeVariant;
+    button.textContent = VARIANT_LABELS[key] + (entry?.status === 'loading' ? ' · 加载中' : entry?.status === 'error' ? ' · 重试' : '');
+    if (entry?.status === 'loading') notes.push(`${VARIANT_LABELS[key]} 下载及解码 ${Math.min(100, Math.floor(100*entry.received/entry.total))}%`);
+    if (entry?.status === 'error') notes.push(`${VARIANT_LABELS[key]} 加载失败：${entry.error.message}`);
+    if (entry?.status === 'idle') notes.push(`点击${VARIANT_LABELS[key]}按钮后加载`);
+  }
+  $('variant-status').textContent = notes.join('；') || (variants?.entries.size > 1
+    ? [...variants.entries.values()].every(entry => entry.status === 'ready') ? '两个版本已就绪，切换保持当前视角与校正' : '正在准备模型版本…' : '');
+}
+
+function updateModelDetails() {
+  const m = manifest, sizes = validateModelFiles(m);
+  $('details').textContent = `${m.gaussian_count.toLocaleString()} 个高斯 · SH ${m.render.sh_degree}（${shStorageFormat(m).packed ? 'FP16' : 'FP32'}） · ${VARIANT_LABELS[activeVariant]} · 下载 ${(sizes.downloadBytes/1048576).toFixed(1)} MiB / 解码后 ${(sizes.decodedBytes/1048576).toFixed(1)} MiB`;
+}
+
+function updateVariantAddress() {
+  const address = new URL(location.href);
+  if (variants?.entries.size > 1) address.searchParams.set('variant', activeVariant);
+  else address.searchParams.delete('variant');
+  history.replaceState(null, '', address);
+}
+
+async function switchVariant(key) {
+  if (!ready || loading || stopped || capturing || calibrationDragging || alignmentSaving || key === activeVariant) return;
+  const pool = variants, previous = activeVariant;
+  if (!pool?.entries.has(key) || pool.entries.get(key).status === 'loading') return;
+  // Download only after an explicit button click. Keep the current version
+  // interactive while the requested one downloads and decodes on a worker.
+  let buffers;
+  try { buffers = await pool.load(key); }
+  catch { if (!stopped && variants === pool) updateVariantControls(); return; }
+  while ((capturing || calibrationDragging || alignmentSaving) && !stopped && variants === pool) await new Promise(resolve => setTimeout(resolve, 10));
+  if (stopped || variants !== pool) return;
+  loading = true; ready = false; clearPointerState(); keys.clear();
+  frameTimes = []; updateFpsHud(null, 'loading', '切换中');
+  $('model').disabled = $('camera').disabled = $('save').disabled = $('reset').disabled = true;
+  updateAlignmentControls(); updateCompatibilityControls(); updateVariantControls();
+  try {
+    while ((busy || capturing) && !stopped) await new Promise(resolve => setTimeout(resolve, 10));
+    if (stopped || variants !== pool) return;
+    const metadata = pool.entries.get(key).metadata;
+    // Wait for the frame fence, free the previous model, then upload ONE
+    // cached version. Do not allocate both models on a mobile GPU at once.
+    renderer.unloadModel();
+    await renderer.loadModel({...buffers, metadata});
+    if (stopped) return;
+    manifest = metadata; activeVariant = key;
+    invalidatePreview(); frameTimes = []; rendered = false;
+    updateModelDetails(); updateVariantAddress(); markCameraChanged();
+    ready = true;
+  } catch (error) {
+    if (stopped) return;
+    // A download failure leaves the active GPU model intact. If upload
+    // failed after release, restore its already decoded CPU buffers.
+    if (!renderer.model) {
+      try { await renderer.loadModel({...pool.entries.get(previous).buffers, metadata: pool.entries.get(previous).metadata}); }
+      catch (restoreError) { message(restoreError); return; }
+    }
+    ready = true; markCameraChanged();
+    const entry = pool.entries.get(key);
+    entry.status = 'error'; entry.error = error;
+  } finally {
+    loading = false;
+    if (!stopped) {
+      $('model').disabled = false;
+      $('camera').disabled = $('reset').disabled = !ready;
+      $('save').disabled = !ready || !rendered;
+      updateAlignmentControls(); updateCompatibilityControls(); updateVariantControls();
+    }
+  }
+}
+for (const key of ['sog', 'bin']) $(`variant-${key}`).addEventListener('click', () => switchVariant(key));
+
 async function switchModel(entry) {
   clearPointerState();
   if (loading || stopped) return;
+  variants?.dispose(); variants = null; activeVariant = '';
   loading = true;
   ready = false;
+  frameTimes = []; updateFpsHud(null, 'loading', '加载中');
   rendered = false;
   canvas.style.visibility = 'hidden';
   alignmentSaveController?.abort();
@@ -308,6 +412,8 @@ async function switchModel(entry) {
   invalidatePreview();
   keys.clear();
   $('model').disabled = $('camera').disabled = $('save').disabled = $('reset').disabled = true;
+  $('compatibility').disabled = true;
+  updateVariantControls();
   $('error').hidden = true;
   $('loading').hidden = false;
   $('progress').removeAttribute('value');
@@ -320,12 +426,18 @@ async function switchModel(entry) {
     // A previous frame may still be on the GPU when a dropdown is changed.
     while ((busy || capturing) && !stopped) await new Promise((resolve) => setTimeout(resolve, 10));
     if (stopped) return;
+    renderer.unloadModel();
     const base = new URL(entry.url, document.baseURI);
     const m = await fetchJson(base, loadController.signal);
     if (stopped) return;
     validateManifest(m);
-    const total = ['geometry','sh'].reduce((s,key) => s + validateFile(m.files[key]).downloadBytes,0);
-    const decodedTotal = ['geometry','sh'].reduce((s,key) => s + m.files[key].byteLength,0);
+    const pool = new ModelVariants(m, base, {onChange: () => { if (variants === pool && !stopped) updateVariantControls(); }});
+    variants = pool;
+    for (const version of pool.entries.values()) validateManifest(version.metadata);
+    // A paired model always starts with SOG. Neither a remembered selection,
+    // a URL hint nor a failed SOG request may implicitly download the binary.
+    const selected = pool.entries.has('sog') ? 'sog' : pool.default;
+    const total = pool.entries.get(selected).total;
     let received = 0;
     $('progress').max = total;
     $('progress').value = 0;
@@ -335,16 +447,19 @@ async function switchModel(entry) {
       $('progress').value = received;
       $('load-detail').textContent = `下载及解码 ${(received / 1048576).toFixed(1)} / ${(total / 1048576).toFixed(1)} MiB`;
     };
-    const [geometry, sh, calibration] = await Promise.all([
-      ...['geometry', 'sh'].map((key) => loadBuffer(m.files[key], base, loadController.signal, onBytes)),
+    const [{geometry, sh}, calibration] = await Promise.all([
+      pool.load(selected, onBytes),
       loadAlignment(base,m,loadController.signal),
     ]);
     if (stopped) return;
     $('load-detail').textContent = '上传到本机显卡';
-    await renderer.loadModel({ geometry, sh, metadata: m });
+    const shown = pool.entries.get(selected).metadata;
+    await renderer.loadModel({ geometry, sh, metadata: shown });
     if (stopped) return;
+    activeEntry = entry;
     activeProjection = projection;
-    manifest = m;
+    manifest = shown;
+    activeVariant = selected;
     currentId = entry.id;
     modelManifestUrl = base;
     alignmentState = calibration.alignment ?? createFrameAlignment(m,entry.id);
@@ -357,7 +472,7 @@ async function switchModel(entry) {
     const navigationBounds = m.navigation_bounds ?? m.bounds;
     const spans = navigationBounds.max.map((v, i) => v-navigationBounds.min[i]).filter(v => Number.isFinite(v) && v > 0);
     baseSpeed = spans.length ? Math.max(0.05, Math.min(...spans) * 0.08) : 0.05;
-    $('details').textContent = `${m.gaussian_count.toLocaleString()} 个高斯 · SH ${m.render.sh_degree}（${shStorageFormat(m).packed ? 'FP16' : 'FP32'}） · 下载 ${(total / 1048576).toFixed(1)} MiB${total !== decodedTotal ? ` / 解码后 ${(decodedTotal / 1048576).toFixed(1)} MiB` : ''}`;
+    updateModelDetails();
     $('model').value = entry.id;
     const address = new URL(location.href);
     if (!address.searchParams.has('url')) {
@@ -366,10 +481,13 @@ async function switchModel(entry) {
     }
     frameTimes = [];
     ready = true;
+    updateVariantAddress();
   } catch (error) {
     loadController.abort();
+    variants?.dispose(); variants = null;
     if (stopped) return;
     message(error);
+    updateFpsHud(null, 'error', '加载失败');
     $('stats').textContent = '载入失败，请刷新重试或选择其他模型';
   } finally {
     loading = false;
@@ -379,6 +497,8 @@ async function switchModel(entry) {
       $('camera').disabled = $('reset').disabled = !ready;
       $('save').disabled = !ready || !rendered;
       updateAlignmentControls();
+      updateCompatibilityControls();
+      updateVariantControls();
     }
   }
 }
@@ -478,7 +598,10 @@ window.addEventListener('keydown', (e) => {
 });
 window.addEventListener('keyup', (e) => keys.delete(e.code));
 window.addEventListener('blur', () => { keys.clear(); clearPointerState(); });
-document.addEventListener('visibilitychange', () => { keys.clear(); clearPointerState(); frameTimes = []; dirty = true; });
+document.addEventListener('visibilitychange', () => {
+  keys.clear(); clearPointerState(); frameTimes = []; dirty = true;
+  if (!stopped) updateFpsHud(null, document.hidden ? 'paused' : 'rendering', document.hidden ? '后台暂停' : '待渲染');
+});
 window.addEventListener('resize', () => { clearPointerState(); adaptive.markMotion(performance.now()); markCameraChanged(true); updateGizmo(); });
 $('resolution').addEventListener('change', () => { frameTimes = []; dirty = true; });
 $('adaptive').addEventListener('change', () => { frameTimes = []; dirty = true; });
@@ -636,8 +759,9 @@ async function frame(time) {
         const frameCamera = copyCamera(camera);
         const frameRevision = cameraRevision;
         const frameProjection = activeProjection;
+        const frameSortMode = activeCompatibility ? 'camera' : 'radial';
         renderer.setCamera(frameCamera);
-        const result = await renderer.render({ width, height, projection: frameProjection });
+        const result = await renderer.render({ width, height, projection: frameProjection, sortMode: frameSortMode });
         if (stopped) return;
         lastMainCamera = frameCamera;
         mainRevision = frameRevision;
@@ -646,6 +770,8 @@ async function frame(time) {
         // edge so manual re-enabling also adapts correctly in portrait views.
         adaptive.record({ width: choice.width, renderMs: result.renderMs }, choice.moving);
         canvas.dataset.quality = choice.moving ? 'moving' : 'full';
+        canvas.dataset.variant = activeVariant;
+        canvas.dataset.compatibility = frameSortMode === 'camera' ? 'insta360' : 'native';
         canvas.style.visibility = 'visible';
         rendered = true;
         $('save').disabled = loading || capturing;
@@ -653,14 +779,16 @@ async function frame(time) {
         frameTimes.push(done); frameTimes = frameTimes.filter((t) => t >= done-1000);
         const fps = frameTimes.length > 1 ? (frameTimes.length-1)*1000/(done-frameTimes[0]) : null;
         if (done-lastUiUpdate > 200 || !$('continuous').checked) {
+          updateFpsHud(fps, 'rendering', fps === null ? '等待连续帧' : '主画面');
           $('stats').textContent = `${width} × ${height} · ${result.renderMs.toFixed(1)} ms / 完成帧${Number.isFinite(result.gpuMs) ? ` · GPU ≈ ${result.gpuMs.toFixed(1)} ms` : ''}${fps !== null ? ` · ${fps.toFixed(1)} FPS` : ''}`;
-          $('quality').textContent = `${choice.moving ? '交互分辨率' : '完整分辨率'} · WebGL2 Gaussian Splatting · ${frameProjection === 'pinhole' ? '直接针孔' : '鱼眼透视显示'}${result.accumulation === 'unorm8' ? ' · 兼容色彩精度' : ''}`;
+          $('quality').textContent = `${choice.moving ? '交互分辨率' : '完整分辨率'} · WebGL2 Gaussian Splatting · ${frameProjection === 'pinhole' ? '直接针孔' : '鱼眼透视显示'}${frameSortMode === 'camera' ? ' · 影石兼容' : ''}${result.accumulation === 'unorm8' ? ' · 兼容色彩精度' : ''}`;
           lastUiUpdate = done;
         }
-      } catch (error) { ready = false; message(error); }
+      } catch (error) { ready = false; updateFpsHud(null, 'error', '渲染失败'); message(error); }
       finally { busy = false; }
     } else if (frameTimes.length && time-frameTimes.at(-1) > 1000) {
       frameTimes = [];
+      updateFpsHud(0, 'idle', '静止');
       $('stats').textContent = $('stats').textContent.replace(/ · [\d.]+ FPS$/, '') + ' · 静止';
     }
   }
@@ -732,7 +860,7 @@ async function main() {
     defaultId = params.get('model') || data.default || catalog[0].id;
   }
   $('model').replaceChildren(...catalog.map((entry) => new Option(entry.name || entry.id, entry.id)));
-  const entry = catalog.find((e) => e.id === defaultId);
+  const entry = catalog.find((e) => e.id === defaultId || e.aliases?.includes(defaultId));
   if (!entry) throw new Error(`模型列表中没有 ${defaultId}`);
   scheduleFrame();
   await switchModel(entry);

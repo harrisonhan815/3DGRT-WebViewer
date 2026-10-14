@@ -1,5 +1,5 @@
-// Stable full-precision radial ordering. Unlike quantized depth bins, all
-// positive float32 distance bits participate in the four radix passes.
+// Stable float32 radix ordering: radial distance for native fisheye models,
+// camera depth for standard 3DGS compatibility. No quantized depth bins.
 let positions = null;
 let generation = 0;
 
@@ -7,8 +7,6 @@ export function radialOrder(points, camera) {
   const count = points.length / 3;
   const keys = new Uint32Array(count);
   const distances = new Float32Array(keys.buffer);
-  let order = new Uint32Array(count);
-  let scratch = new Uint32Array(count);
   const f = Math.fround;
   const p = camera.map(f);
   for (let i = 0; i < count; i++) {
@@ -20,8 +18,30 @@ export function radialOrder(points, camera) {
     // rescaling overhead while preserving the two rounded hypotf stages.
     const xy = f(Math.sqrt(x*x + y*y));
     distances[i] = f(Math.sqrt(xy*xy + z*z));
-    order[i] = i;
   }
+  return radixOrder(keys);
+}
+
+export function cameraOrder(points, camera, forward) {
+  if (!forward || forward.length !== 3 || !forward.every(Number.isFinite)) throw new Error('Invalid sort direction.');
+  const count=points.length/3,keys=new Uint32Array(count),depth=new Float32Array(keys.buffer);
+  const f=Math.fround,p=camera.map(f),direction=forward.map(f);
+  for(let i=0;i<count;i++) {
+    const x=f(points[3*i]-p[0]),y=f(points[3*i+1]-p[1]),z=f(points[3*i+2]-p[2]);
+    const value=f(f(f(x*direction[0])+f(y*direction[1]))+f(z*direction[2]));
+    if(Number.isNaN(value)) throw new Error('Non-finite camera sort depth.');
+    depth[i]=value===0?0:value;
+    // Monotonic unsigned keys for signed IEEE754 depths. Behind-camera
+    // splats remain in the index buffer and are rejected by projection.
+    const bits=keys[i];keys[i]=(bits & 0x80000000)?~bits:bits^0x80000000;
+  }
+  return radixOrder(keys);
+}
+
+function radixOrder(keys) {
+  const count=keys.length;
+  let order=new Uint32Array(count),scratch=new Uint32Array(count);
+  for(let i=0;i<count;i++) order[i]=i;
   const histogram = new Uint32Array(256);
   for (let shift = 0; shift < 32; shift += 8) {
     histogram.fill(0);
@@ -50,7 +70,8 @@ if (typeof WorkerGlobalScope !== 'undefined' && self instanceof WorkerGlobalScop
       } else if (data.type === 'sort') {
         if (!positions || data.generation !== generation) throw new Error('Stale sort model.');
         const start = performance.now();
-        const order = radialOrder(positions, data.position);
+        if (!['radial','camera',undefined].includes(data.mode)) throw new Error('Unsupported depth sort.');
+        const order = data.mode==='camera' ? cameraOrder(positions,data.position,data.forward) : radialOrder(positions, data.position);
         self.postMessage({type:'sorted',generation,requestId:data.requestId,
           order:order.buffer,sortMs:performance.now()-start}, [order.buffer]);
       }

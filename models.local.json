@@ -1,35 +1,29 @@
 {
-  "default": "fc-room1-multifov-pruned",
+  "default": "zj-office1-2",
   "models": [
     {
-      "id": "fc-room1-multifov-pruned",
-      "name": "room1",
-      "url": "models/fc-room1-multifov-pruned/manifest.json",
+      "id": "zj-office1-4",
+      "name": "office1 4倍下采样",
+      "url": "models/zj-office1-4/manifest.json",
       "output_projection": "pinhole"
     },
     {
-      "id": "fc-lounge-multifov-pruned",
-      "name": "lounge",
-      "url": "models/fc-lounge-multifov-pruned/manifest.json",
+      "id": "zj-office1-2",
+      "name": "office1 2倍下采样",
+      "url": "models/zj-office1-2/manifest.json",
       "output_projection": "pinhole"
     },
     {
       "id": "zj-office1",
-      "name": "office1",
+      "name": "office1 全分辨率",
       "url": "models/zj-office1/manifest.json",
       "output_projection": "pinhole"
     },
     {
-      "id": "fc-room1-pinhole-trial",
-      "name": "room1 · 针孔监督试验",
-      "url": "models/fc-room1-pinhole-trial/manifest.json",
+      "id": "zj-office1-insta",
+      "name": "office1 官方版",
+      "url": "models/zj-office1-insta/manifest.json",
       "output_projection": "pinhole"
-    },
-    {
-      "id": "fc-room1-webgl2",
-      "name": "room1 · 早期鱼眼版",
-      "url": "models/fc-room1-webgl2/manifest.json",
-      "output_projection": "fisheye-perspective"
     }
   ]
 }

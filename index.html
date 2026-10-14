@@ -5,7 +5,7 @@
   <meta name="viewport" content="width=device-width,initial-scale=1">
   <meta name="color-scheme" content="dark">
   <title>3DGRT Test</title>
-  <link rel="stylesheet" href="./style.css">
+  <link rel="stylesheet" href="./style.css?v=20261013-lazy-hud-1">
 </head>
 <body>
   <canvas id="view" tabindex="0" aria-label="三维场景，拖动转向，WASD 移动"></canvas>
@@ -13,7 +13,15 @@
   <aside id="panel">
     <header><strong>3DGRT Viewer</strong><span>WebGL2 Gaussian Splatting</span></header>
     <label>模型<select id="model" disabled></select></label>
+    <div id="variant-controls" hidden>
+      <div class="row variant-buttons" role="group" aria-label="模型版本">
+        <button id="variant-sog" type="button" aria-pressed="false" disabled>SOG</button>
+        <button id="variant-bin" type="button" aria-pressed="false" disabled>二进制</button>
+      </div>
+      <p id="variant-status" class="muted" role="status" aria-live="polite"></p>
+    </div>
     <label>相机<select id="camera" disabled></select></label>
+    <label id="compatibility-control" class="check" hidden title="开启后使用针孔投影与视深排序；关闭可对比本框架的径向排序。"><input id="compatibility" type="checkbox" disabled>影石 / 标准 3DGS 兼容模式</label>
     <details id="alignment-controls">
       <summary>可视化地平面校正</summary>
       <label class="check"><input id="align-tool" type="checkbox" disabled>显示地平面与三轴工具</label>
@@ -46,7 +54,12 @@
     <p id="adapter" class="muted"></p>
   </aside>
   <button id="toggle" aria-label="展开或收起控制栏">☰</button>
-  <button id="safe-exit" type="button" title="停止渲染并清理资源后关闭页面">安全退出</button>
+  <div id="viewer-hud">
+    <button id="safe-exit" type="button" title="停止渲染并清理资源后关闭页面">安全退出</button>
+    <output id="fps-hud" data-state="loading" aria-label="主画面渲染帧率" title="主画面的实际完成帧率；静止时按需渲染。可开启持续渲染来测试帧率。">
+      <span id="fps-value">— FPS</span><small id="fps-state">准备中</small>
+    </output>
+  </div>
   <div id="flight-controls" aria-label="水平移动摇杆">
     <div class="flight-stick" data-stick="right" aria-label="右摇杆：沿校准地平面前后、左右移动，保持高度"><span class="stick-knob"></span><span class="stick-label">水平移动</span></div>
   </div>
@@ -61,6 +74,6 @@
     <strong id="exit-title">正在安全退出</strong>
     <p id="exit-status"></p>
   </section>
-  <script type="module" src="./main.js"></script>
+  <script type="module" src="./main.js?v=20261013-lazy-hud-1"></script>
 </body>
 </html>
