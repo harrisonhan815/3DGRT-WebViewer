@@ -1,4 +1,4 @@
-import {loadModelBuffers, validateModelFiles} from './model-loader.js?v=20261013-lazy-hud-1';
+import {loadModelBuffers, validateModelFiles} from './model-loader.js?v=20261016-model-cache-1';
 
 export const VARIANT_LABELS = {sog: 'SOG', bin: '二进制'};
 const FIELDS = new Set(['files', 'storage', 'precision', 'gaussian_order', 'decoded_bounds', 'known_differences', 'native_support']);

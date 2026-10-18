@@ -1,11 +1,13 @@
-import {validateFile, validateModelFiles} from './model-loader.js?v=20261013-lazy-hud-1';
+import {modelPartUrl, validateFile, validateModelFiles} from './model-loader.js?v=20261016-model-cache-1';
 import {sha256Hex} from './sha256.js?v=20261013-lazy-hud-1';
 
 const gzipMagic = data => data.length >= 3 && data[0] === 0x1f && data[1] === 0x8b && data[2] === 8;
 const expectedDownload = part => part.downloadByteLength ?? part.byteLength;
 
 async function readPart(part, base, progress) {
-  const response = await fetch(new URL(part.path,base),{credentials:'omit'});
+  const response = await fetch(modelPartUrl(part,base),{
+    credentials:'omit', cache:part.sha256 === undefined ? 'no-store' : 'default',
+  });
   if (!response.ok || !response.body) throw new Error(`模型分片下载失败：${part.path}（HTTP ${response.status}）`);
   // Fetch may already have removed a server's Content-Encoding layer. The
   // JS body can therefore be either stored gzip bytes or decoded bytes.
@@ -18,7 +20,9 @@ async function readPart(part, base, progress) {
     while (true) {
       const {value,done} = await reader.read();
       if (done) break;
-      if (received + value.byteLength > capacity) throw new Error(`模型分片下载长度超出声明：${part.path}`);
+      if (received + value.byteLength > capacity) throw new Error(
+        `模型分片下载长度超出声明：${part.path}（声明最多 ${capacity} 字节，收到至少 ${received + value.byteLength} 字节）。` +
+        '清单与文件可能来自不同版本，请刷新页面；若仍报错，请重新同步完整模型目录。');
       buffer.set(value,received); received += value.byteLength;
       const anticipated = part.compression === 'gzip' && received >= 3 && gzipMagic(buffer.subarray(0,received)) ? expectedDownload(part) : part.byteLength;
       // This is asset-budget progress, not a claim about physical wire bytes.

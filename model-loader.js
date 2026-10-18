@@ -3,6 +3,18 @@
 // The renderer validates dtype/stride; workers restore and check those bytes.
 const MAX_PART_BYTES = 100 * 1024 * 1024;
 
+export function modelPartUrl(part, base) {
+  const url = new URL(part.path, base);
+  if (part.sha256 !== undefined) {
+    // A model can be re-exported at the same path. Bind the HTTP cache entry
+    // to this manifest's content, including the binary transport layout:
+    // binary SHA256 describes decoded bytes; SOG SHA256 describes the ZIP.
+    url.searchParams.set('__fc_asset', [part.sha256, part.downloadByteLength ?? part.byteLength,
+      part.byteLength, part.compression ?? 'none', part.transform ?? 'none'].join('.'));
+  }
+  return url;
+}
+
 export function validateModelFiles(manifest) {
   if (manifest.storage === undefined) {
     const sizes = ['geometry', 'sh'].map(key => validateFile(manifest.files?.[key]));
@@ -31,7 +43,7 @@ export function loadModelBuffers(manifest, base, signal, onProgress = () => {}) 
     const abort = () => fail(new DOMException('Model loading was cancelled.', 'AbortError'));
     try {
       if (signal?.aborted) { abort(); return; }
-      worker = new Worker(new URL('./model-loader.worker.js?v=20261013-lazy-hud-1', import.meta.url), {type: 'module'});
+      worker = new Worker(new URL('./model-loader.worker.js?v=20261016-model-cache-1', import.meta.url), {type: 'module'});
       signal?.addEventListener('abort', abort, {once: true});
       worker.onmessage = event => {
         if (finished) return;
@@ -89,7 +101,7 @@ export function loadBuffer(file, base, signal, onProgress = () => {}) {
       validateFile(file);
       if (signal?.aborted) { abort(); return; }
       if (typeof Worker === 'undefined') throw new Error('此浏览器不支持模型后台加载，请更新浏览器');
-      worker = new Worker(new URL('./model-loader.worker.js?v=20261013-lazy-hud-1',import.meta.url),{type:'module'});
+      worker = new Worker(new URL('./model-loader.worker.js?v=20261016-model-cache-1',import.meta.url),{type:'module'});
       signal?.addEventListener('abort',abort,{once:true});
       worker.onmessage = event => {
         if (finished) return;

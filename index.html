@@ -39,6 +39,8 @@
       </select></label>
       <label>垂直视场角<input id="fov" type="number" min="20" max="120" value="90" step="1"></label>
     </div>
+    <label class="check" title="开启后，以当前视线中心为鱼眼光轴渲染，再重投影到当前针孔视场；关闭后直接渲染针孔。"><input id="fisheye-reproject" type="checkbox" checked disabled>鱼眼渲染 → 针孔显示</label>
+    <p id="projection-status" class="muted" role="status" aria-live="polite">等待模型</p>
     <label class="check"><input id="adaptive" type="checkbox">移动时自适应分辨率</label>
     <label class="check"><input id="fisheye-enabled" type="checkbox" checked>显示 180° 鱼眼对比</label>
     <label>交互帧率目标<select id="target-fps">
@@ -74,6 +76,6 @@
     <strong id="exit-title">正在安全退出</strong>
     <p id="exit-status"></p>
   </section>
-  <script type="module" src="./main.js?v=20261013-lazy-hud-1"></script>
+  <script type="module" src="./main.js?v=20261018-fisheye-default-1"></script>
 </body>
 </html>

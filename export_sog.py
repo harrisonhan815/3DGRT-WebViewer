@@ -6,11 +6,11 @@ does not change the renderer, camera convention, training sort or alignment.
 import hashlib
 import json
 import math
-import os
 from pathlib import Path
 import shutil
 import subprocess
-import tempfile
+from contextlib import nullcontext
+from export_files import ExportFiles
 
 import numpy as np
 
@@ -63,7 +63,7 @@ def encoder_command():
 
 def export_sog(checkpoint, output, *, source_name="checkpoint.pt", camera_json=None,
                data_path=None, fov_y=math.pi / 2, overwrite=False, sh_dtype="float16",
-               alignment=None, gpu="0", iterations=10):
+               alignment=None, gpu="0", iterations=10, _output_files=None):
     from sog_codec import decode_sog
     from serve import validate_alignment
 
@@ -122,28 +122,31 @@ def export_sog(checkpoint, output, *, source_name="checkpoint.pt", camera_json=N
         if previous.get("schema") != SCHEMA:
             raise ValueError("Refusing to replace a different manifest schema")
     output.parent.mkdir(parents=True, exist_ok=True)
-    with tempfile.TemporaryDirectory(prefix=".sog-export-", dir=output.parent) as temporary:
-        stage = Path(temporary)
+    with (ExportFiles(output) if _output_files is None else nullcontext(_output_files)) as files:
         print(f"Encoding {count:,} Gaussians as SOG (lossy, no pruning) ...", flush=True)
-        write_ply(checkpoint, stage / "input.ply", render["sh_degree"])
-        subprocess.run(command + ["--gpu", str(gpu), "--sh-iterations", str(iterations), "--no-tty",
-                                  str(stage / "input.ply"), str(stage / "model.sog")], check=True)
-        decoded, decoded_sh, bands, meta = decode_sog(stage / "model.sog")
+        input_ply = files.scratch('.ply')
+        encoded_sog = files.path('model.sog')
+        write_ply(checkpoint, input_ply, render["sh_degree"])
+        # The unique scratch filename is reserved by us; only that empty file
+        # is replaced by the encoder. Published model.sog is still untouched.
+        subprocess.run(command + ["--gpu", str(gpu), "--sh-iterations", str(iterations), "--no-tty", "--overwrite",
+                                  str(input_ply), str(encoded_sog)], check=True)
+        decoded, decoded_sh, bands, meta = decode_sog(encoded_sog)
         if len(decoded) != count or bands != render["sh_degree"]:
             raise ValueError("SOG encoder changed the Gaussian count or SH degree")
         if sh_dtype == "float16" and np.max(np.abs(decoded_sh)) > 65504:
             raise ValueError("Decoded SOG SH exceeds FP16; use --sh-dtype float32")
         manifest["decoded_bounds"] = {"min": decoded[:, :3].min(0).tolist(), "max": decoded[:, :3].max(0).tolist()}
-        payload = (stage / "model.sog").read_bytes()
+        payload = encoded_sog.read_bytes()
         manifest["storage"] = {"format": "sog-v2", "path": "model.sog", "byteLength": len(payload),
                                "sha256": hashlib.sha256(payload).hexdigest(),
                                "generator": meta.get("asset", {}).get("generator"), "sh_iterations": iterations}
-        (stage / "manifest.json").write_text(json.dumps(manifest, indent=2, ensure_ascii=False, allow_nan=False) + "\n")
-        output.mkdir(exist_ok=overwrite)
-        os.replace(stage / "model.sog", output / "model.sog")
+        if alignment_path and alignment_path.read_bytes() != alignment_bytes:
+            raise RuntimeError("Alignment changed during export; retry with the current file")
         if alignment_bytes is not None and not saved_alignment.exists():
-            saved_alignment.write_bytes(alignment_bytes)
+            files.path('alignment.json').write_bytes(alignment_bytes)
         # Retain old binary files/sidecars when explicitly overwriting an
         # existing directory; the new manifest references only model.sog.
-        os.replace(stage / "manifest.json", output / "manifest.json")
+        if _output_files is None:
+            files.commit(manifest)
     return manifest

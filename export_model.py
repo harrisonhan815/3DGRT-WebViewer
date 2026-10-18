@@ -20,11 +20,10 @@ import gzip
 import hashlib
 import json
 import math
-import os
 from pathlib import Path
-import shutil
 import struct
-import tempfile
+from contextlib import nullcontext
+from export_files import ExportFiles
 import zlib
 
 import numpy as np
@@ -191,17 +190,18 @@ def decode_binary_part(encoded, part):
     return raw
 
 
-def write_binary_part(directory, name, number, data, compression="none", *, shuffle_bytes=4):
+def write_binary_part(directory, name, number, data, compression="none", *, shuffle_bytes=4, output_files=None):
     if not name or Path(name).name != name or any(char in name for char in "\\/%?#"):
         raise ValueError("Buffer name must be a simple filename component")
     encoded, part = encode_binary_part(data, compression, shuffle_bytes=shuffle_bytes)
     suffix = ".shuf.gz" if part["transform"] in ("byte-shuffle-2", "byte-shuffle-4") else ".gz" if part["compression"] == "gzip" else ""
     path = f"{name}.{number:03d}.bin{suffix}"
-    (Path(directory) / path).write_bytes(encoded)
+    destination = output_files.path(path) if output_files is not None else Path(directory)/path
+    destination.write_bytes(encoded)
     return {"path": path, **part}
 
 
-def write_parts(directory, name, array, stride, max_bytes, compression="none", *, shuffle_bytes=4):
+def write_parts(directory, name, array, stride, max_bytes, compression="none", *, shuffle_bytes=4, output_files=None):
     """Write record-aligned parts; byteLength always means decoded GPU bytes."""
     if not stride <= max_bytes < 100 * 1024 * 1024:
         raise ValueError("Chunk budget must hold a record and remain below 100 MiB")
@@ -212,7 +212,8 @@ def write_parts(directory, name, array, stride, max_bytes, compression="none", *
     parts = []
     for number, start in enumerate(range(0, len(array), records_per_part)):
         end = min(start + records_per_part, len(array))
-        parts.append(write_binary_part(directory, name, number, memoryview(array[start:end]).cast("B"), compression, shuffle_bytes=shuffle_bytes))
+        parts.append(write_binary_part(directory, name, number, memoryview(array[start:end]).cast("B"), compression,
+                                       shuffle_bytes=shuffle_bytes, output_files=output_files))
     return {"byteLength": array.nbytes, "downloadByteLength": sum(part["downloadByteLength"] for part in parts),
             "stride": stride, "parts": parts}
 
@@ -405,7 +406,7 @@ def export_cameras(checkpoint, positions, camera_json=None, data_path=None, fov_
 
 def export_checkpoint(checkpoint, output, *, source_name="checkpoint.pt", chunk_bytes=64*1024*1024,
                       camera_json=None, data_path=None, fov_y=math.radians(70),
-                      overwrite=False, compression="gzip-shuffle", sh_dtype="float16"):
+                      overwrite=False, compression="gzip-shuffle", sh_dtype="float16", _output_files=None):
     output = Path(output).expanduser()
     if output.is_symlink() or (output.exists() and (not output.is_dir() or not overwrite)):
         raise FileExistsError(f"Output exists: {output}; choose a new directory or explicitly --overwrite")
@@ -453,23 +454,17 @@ def export_checkpoint(checkpoint, output, *, source_name="checkpoint.pt", chunk_
                 name = part.get("path", "")
                 if name and Path(name).name == name and name not in ("alignment.json", "cameras.json", "manifest.json"):
                     old_parts.add(name)
-    with tempfile.TemporaryDirectory(prefix=".webgl2-export-", dir=output.parent) as temporary:
-        stage = Path(temporary)
+    with (ExportFiles(output) if _output_files is None else nullcontext(_output_files)) as files:
         manifest["files"] = {
-            "geometry": write_parts(stage, "geometry", geometry, 48, chunk_bytes, compression),
-            "sh": write_parts(stage, "sh", sh, 48*SH_DTYPES[sh_dtype].itemsize, chunk_bytes, compression,
-                              shuffle_bytes=SH_DTYPES[sh_dtype].itemsize),
+            "geometry": write_parts(output, "geometry", geometry, 48, chunk_bytes, compression, output_files=files),
+            "sh": write_parts(output, "sh", sh, 48*SH_DTYPES[sh_dtype].itemsize, chunk_bytes, compression,
+                              shuffle_bytes=SH_DTYPES[sh_dtype].itemsize, output_files=files),
         }
         set_sh_precision_metadata(manifest, sh_dtype)
-        (stage / "manifest.json").write_text(json.dumps(manifest, indent=2, ensure_ascii=False, allow_nan=False)+"\n")
         # Existing sidecars (including manual alignment) are untouched.
-        output.mkdir(exist_ok=overwrite)
-        new_parts = {p["path"] for spec in manifest["files"].values() for p in spec["parts"]}
-        for name in sorted(new_parts):
-            os.replace(stage/name, output/name)
-        for name in old_parts-new_parts:
-            (output/name).unlink(missing_ok=True)
-        os.replace(stage/"manifest.json", output/"manifest.json")
+        files.obsolete.update(old_parts)
+        if _output_files is None:
+            files.commit(manifest)
     return manifest
 
 

@@ -2,17 +2,18 @@ import { WebGlSplatRenderer } from './renderer.js?v=20261013-lazy-hud-1';
 import { AdaptiveResolution } from './adaptive-resolution.js?v=20261013-lazy-hud-1';
 import { createFrameAlignment, frameFromAlignment, defaultFrame, applyAlignment, alignmentUp, loadAlignment, ALIGNMENT_SCHEMA } from './alignment.js?v=20261013-lazy-hud-1';
 import { AlignmentGizmo } from './alignment-gizmo.js?v=20261013-lazy-hud-1';
-import { validateModelFiles } from './model-loader.js?v=20261013-lazy-hud-1';
-import { ModelVariants, VARIANT_LABELS } from './model-variants.js?v=20261013-lazy-hud-1';
+import { validateModelFiles } from './model-loader.js?v=20261016-model-cache-1';
+import { ModelVariants, VARIANT_LABELS } from './model-variants.js?v=20261016-model-cache-1';
 import { FlightControls } from './flight-controls.js?v=20261013-lazy-hud-1';
 
 const $ = (id) => document.getElementById(id);
 const DEFAULT_FOV_DEG = 90;
+const DEFAULT_PROJECTION = 'fisheye-perspective';
 const canvas = $('view');
 const previewCanvas = $('fisheye-view');
 let renderer, manifest, camera, worldUp, ready = false, loading = false, dirty = true, rendered = false;
 let catalog = [], currentId = '', loadController, busy = false, capturing = false, baseSpeed = 1;
-let activeProjection = 'fisheye-perspective';
+let activeProjection = DEFAULT_PROJECTION;
 let activeEntry = null;
 const activeCompatibility = false;
 let variants = null, activeVariant = '';
@@ -56,6 +57,7 @@ function haltViewer() {
   if (stopped) return;
   stopped = true;
   ready = false;
+  updateProjectionControls();
   updateFpsHud(null, 'stopped', '已停止');
   keys.clear();
   clearPointerState();
@@ -301,7 +303,7 @@ function validateManifest(m) {
 }
 
 function modelProjection(entry) {
-  const projection = entry.output_projection === undefined ? 'fisheye-perspective' : entry.output_projection;
+  const projection = entry.output_projection === undefined ? DEFAULT_PROJECTION : entry.output_projection;
   if (!['pinhole', 'fisheye-perspective'].includes(projection)) {
     throw new Error(`模型 ${entry.id} 的 output_projection 无效：${String(projection)}；只能使用 pinhole 或 fisheye-perspective。`);
   }
@@ -314,7 +316,17 @@ function updateCompatibilityControls() {
   $('compatibility').disabled = true;
 }
 
+function updateProjectionControls() {
+  const control = $('fisheye-reproject');
+  control.checked = activeProjection === 'fisheye-perspective';
+  control.disabled = !ready || loading || stopped || capturing || alignmentSaving || calibrationDragging;
+  $('projection-status').textContent = !ready ? (stopped ? '渲染已停止' : '等待模型')
+    : control.checked ? '主画面：等距鱼眼渲染后重投影，中心视线与当前相机一致'
+      : '主画面：直接针孔渲染';
+}
+
 function updateVariantControls() {
+  updateProjectionControls();
   $('variant-controls').hidden = !variants || variants.entries.size < 2;
   const notes = [];
   for (const key of ['sog', 'bin']) {
@@ -428,7 +440,7 @@ async function switchModel(entry) {
     if (stopped) return;
     renderer.unloadModel();
     const base = new URL(entry.url, document.baseURI);
-    const m = await fetchJson(base, loadController.signal);
+    const m = await fetchJson(base, loadController.signal, 'no-cache');
     if (stopped) return;
     validateManifest(m);
     const pool = new ModelVariants(m, base, {onChange: () => { if (variants === pool && !stopped) updateVariantControls(); }});
@@ -614,6 +626,19 @@ $('fov').addEventListener('change', () => {
   adaptive.markMotion(performance.now());
   markCameraChanged(true);
 });
+$('fisheye-reproject').addEventListener('change', () => {
+  if (!ready || loading || stopped || capturing || alignmentSaving || calibrationDragging) {
+    updateProjectionControls();
+    return;
+  }
+  activeProjection = $('fisheye-reproject').checked ? 'fisheye-perspective' : 'pinhole';
+  // Keep the current pose/FOV and GPU model. Only the projection path changes.
+  frameTimes = []; lastUiUpdate = 0; rendered = false;
+  $('save').disabled = true;
+  updateFpsHud(null, 'rendering', '切换模式');
+  markCameraChanged();
+  updateProjectionControls();
+});
 $('fisheye-enabled').addEventListener('change', () => {
   $('fisheye-panel').hidden = !$('fisheye-enabled').checked;
   if ($('fisheye-enabled').checked) {
@@ -703,6 +728,7 @@ $('continuous').addEventListener('change', () => { frameTimes = []; dirty = true
 $('save').addEventListener('click', async () => {
   if (!ready || !rendered || loading || capturing) return;
   capturing = true;
+  updateProjectionControls();
   $('save').disabled = true;
   try {
     while (busy && !stopped) await new Promise((resolve) => setTimeout(resolve, 10));
@@ -719,7 +745,7 @@ $('save').addEventListener('click', async () => {
     a.href = url; a.download = `${currentId}-webgl2.png`; a.click();
     setTimeout(() => URL.revokeObjectURL(url), 1000);
   } catch (error) { message(error); }
-  finally { capturing = false; $('save').disabled = !ready || loading; }
+  finally { capturing = false; $('save').disabled = !ready || loading; updateProjectionControls(); }
 });
 
 async function frame(time) {
@@ -771,20 +797,23 @@ async function frame(time) {
         adaptive.record({ width: choice.width, renderMs: result.renderMs }, choice.moving);
         canvas.dataset.quality = choice.moving ? 'moving' : 'full';
         canvas.dataset.variant = activeVariant;
+        canvas.dataset.projection = frameProjection;
         canvas.dataset.compatibility = frameSortMode === 'camera' ? 'insta360' : 'native';
         canvas.style.visibility = 'visible';
-        rendered = true;
-        $('save').disabled = loading || capturing;
+        // A mode switch can happen while the previous GPU frame is in flight.
+        // Do not offer that stale frame as the newly selected mode's screenshot.
+        rendered = frameProjection === activeProjection;
+        $('save').disabled = loading || capturing || !rendered;
         const done = performance.now();
         frameTimes.push(done); frameTimes = frameTimes.filter((t) => t >= done-1000);
         const fps = frameTimes.length > 1 ? (frameTimes.length-1)*1000/(done-frameTimes[0]) : null;
         if (done-lastUiUpdate > 200 || !$('continuous').checked) {
           updateFpsHud(fps, 'rendering', fps === null ? '等待连续帧' : '主画面');
           $('stats').textContent = `${width} × ${height} · ${result.renderMs.toFixed(1)} ms / 完成帧${Number.isFinite(result.gpuMs) ? ` · GPU ≈ ${result.gpuMs.toFixed(1)} ms` : ''}${fps !== null ? ` · ${fps.toFixed(1)} FPS` : ''}`;
-          $('quality').textContent = `${choice.moving ? '交互分辨率' : '完整分辨率'} · WebGL2 Gaussian Splatting · ${frameProjection === 'pinhole' ? '直接针孔' : '鱼眼透视显示'}${frameSortMode === 'camera' ? ' · 影石兼容' : ''}${result.accumulation === 'unorm8' ? ' · 兼容色彩精度' : ''}`;
+          $('quality').textContent = `${choice.moving ? '交互分辨率' : '完整分辨率'} · WebGL2 Gaussian Splatting · ${frameProjection === 'pinhole' ? '直接针孔' : '鱼眼渲染 → 针孔重投影'}${frameSortMode === 'camera' ? ' · 影石兼容' : ''}${result.accumulation === 'unorm8' ? ' · 兼容色彩精度' : ''}`;
           lastUiUpdate = done;
         }
-      } catch (error) { ready = false; updateFpsHud(null, 'error', '渲染失败'); message(error); }
+      } catch (error) { ready = false; updateProjectionControls(); updateFpsHud(null, 'error', '渲染失败'); message(error); }
       finally { busy = false; }
     } else if (frameTimes.length && time-frameTimes.at(-1) > 1000) {
       frameTimes = [];
